@@ -25,6 +25,15 @@ class TrayTests(unittest.TestCase):
         self.config.stop(); self.plist.stop()
         self.temp.cleanup()
 
+    def test_key_dialog_is_activated_and_cancel_does_not_save(self):
+        with patch.object(tray, 'NSApplication') as cocoa, patch.object(tray.rumps, 'Window') as window, patch.object(tray, 'ENV', self.root / 'env'):
+            window.return_value.run.return_value = SimpleNamespace(clicked=0, text='')
+            self.app.set_key(None)
+            cocoa.sharedApplication.return_value.activateIgnoringOtherApps_.assert_called_once_with(True)
+            cocoa.sharedApplication.return_value.setActivationPolicy_.assert_called_once_with(tray.NSApplicationActivationPolicyAccessory)
+            self.assertTrue(window.call_args.kwargs['secure'])
+            self.assertFalse(tray.ENV.exists())
+
     def test_login_toggle(self):
         item = SimpleNamespace(state=False)
         self.app.toggle_login(item)

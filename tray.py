@@ -10,6 +10,7 @@ import webbrowser
 from pathlib import Path
 
 import rumps
+from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = ROOT / '.venv/bin/python'
@@ -116,8 +117,11 @@ class Tray(rumps.App):
         self.rebuild()
 
     def set_key(self, _):
+        app = NSApplication.sharedApplication()
+        app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        app.activateIgnoringOtherApps_(True)
         reply = rumps.Window('Anthropic API key (saved in ~/Library/Application Support/slide-tutor/env):',
-                             'slide-tutor', ok='Save', cancel='Cancel', dimensions=(320, 24)).run()
+                             'slide-tutor', ok='Save', cancel='Cancel', dimensions=(320, 24), secure=True).run()
         if not reply.clicked or not reply.text.strip():
             return
         lines = [line for line in (ENV.read_text().splitlines() if ENV.exists() else [])
