@@ -1,0 +1,52 @@
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#22312e;background:#f3f5f2;font-size:14px}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none}  /* fixed-viewport app: only the panels scroll */
+button,select,input,textarea{font:inherit}
+button,select,input{border:1px solid #cbd6ce;border-radius:6px;background:#fff;color:inherit;padding:4px 10px;cursor:pointer}
+button:hover{background:#edf3ee}button:disabled{opacity:.5;cursor:wait}
+main{display:grid;grid-template-columns:minmax(0,1fr) 340px;grid-template-rows:minmax(0,1fr) 205px;height:100%;gap:8px;padding:8px}
+.viewer{display:flex;flex-direction:column;min-height:0;gap:6px}
+.toolbar{display:flex;align-items:center;gap:6px}
+#page{width:56px;text-align:center;cursor:text}#total{color:#63736c}
+#status{margin-left:auto;color:#8a4b2a;font-size:12px}
+#slide-box{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#e4e9e3;border-radius:6px}
+#page-wrap{position:relative;box-shadow:0 1px 4px #0002}#slide{display:block;background:#fff}
+/* Invisible, selectable slide text from pdf.js (subset of pdfjs web/pdf_viewer.css). */
+.textLayer{position:absolute;inset:0;overflow:clip;line-height:1;text-size-adjust:none;transform-origin:0 0;z-index:0}
+.textLayer :is(span,br){color:transparent;position:absolute;white-space:pre;cursor:text;transform-origin:0 0}
+.textLayer ::selection{background:rgb(35 103 78 / .28)}.textLayer br::selection{background:transparent}
+.textLayer .endOfContent{display:block;position:absolute;inset:100% 0 0;z-index:0;cursor:default;user-select:none}
+.textLayer.selecting .endOfContent{top:0}
+#notes{grid-row:1;grid-column:2;overflow:auto;background:#fff;border:1px solid #d7dfd8;border-radius:6px;padding:6px 10px}
+.note-head{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid #e3e9e4;border-radius:0;padding:6px 0 2px;color:#63736c;font-size:12px;font-weight:600;background:none}
+.note-head:hover{color:#23674e;background:none}
+.note.current .note-head{color:#23674e}.note.current .note-head::after{content:" ●"}
+.note-body{padding:4px 0 8px;min-height:1.5em;overflow-x:auto}.note.current .note-body,.note.current .note-line{cursor:text}.note.current .note-line:hover{background:#f3f7f4}
+.note-body p{margin:.3em 0}.note-line{margin:2px 0}
+.note textarea{display:block;width:100%;border:1px solid #23674e;border-radius:4px;padding:6px;font:13px/1.45 ui-monospace,Menlo,monospace;resize:none;overflow:hidden}
+#response{grid-row:2;grid-column:1;overflow:auto;background:#fff;border:1px solid #d7dfd8;border-radius:6px;padding:8px 14px}
+#response p{margin:.4em 0}.empty{color:#8a978f}
+.composer{grid-row:2;grid-column:2;display:flex;flex-direction:column;gap:6px}
+#prompt{flex:1;resize:none;border:1px solid #cbd6ce;border-radius:6px;padding:8px}
+.actions{display:flex;gap:6px}.actions button{flex:1}#ask{background:#23674e;color:#fff;border-color:#23674e}
+.apply{margin:6px 6px 0 0}
+.katex-display{margin:.3em 0;overflow-x:auto;overflow-y:hidden}.render-error{color:#b42318;font-size:12px}
+pre{background:#f3f5f2;padding:8px;border-radius:4px;overflow:auto}
+.popup{position:fixed;z-index:10;background:#23674e;color:#fff;border-color:#23674e;font-size:12px;padding:3px 8px;box-shadow:0 2px 6px #0003}
+.note-add{color:#a3b0a8;font-size:12px;cursor:text;padding:2px 0}.note-add:hover{color:#23674e}
+.note-line{overflow-x:auto;overflow-y:hidden}
+.suggested{border-left:3px solid #23674e;background:#f3f7f4;padding:4px 10px;margin-top:8px;border-radius:0 4px 4px 0}.suggested-label{font-size:11px;font-weight:600;color:#23674e;text-transform:uppercase;letter-spacing:.04em}
+#find{width:180px;cursor:text}#find-count{color:#63736c;font-size:12px;min-width:3em}
+.textLayer span.hit{background:rgb(255 196 0 / .45)}
+#lang{position:relative}#lang summary{list-style:none;cursor:pointer;border:1px solid #cbd6ce;border-radius:6px;background:#fff;padding:4px 8px}#lang summary::-webkit-details-marker{display:none}
+.lang-menu{position:absolute;right:0;bottom:calc(100% + 4px);z-index:10;background:#fff;border:1px solid #cbd6ce;border-radius:6px;padding:8px;display:grid;gap:6px;box-shadow:0 2px 6px #0002;white-space:nowrap}.lang-menu label{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:12px}
+.note.current .note-line.picked{background:rgb(180 35 24 / .10);box-shadow:inset 3px 0 #b42318}
+/* Chain link on the response | prompt boundary: links the next question to the answers above. */
+#link{grid-row:2;grid-column:2;justify-self:start;align-self:center;margin-left:-19px;z-index:2;width:30px;height:30px;padding:0;border-radius:50%;display:grid;place-items:center;color:#63736c}
+#link:disabled{opacity:1;cursor:default;color:#cfd6d1;background:#fff}
+#link[aria-pressed=true]{color:#fff;background:#23674e;border-color:#23674e}
+main.linked #response,main.linked #prompt{border-color:#23674e;box-shadow:0 0 0 2px rgb(35 103 78 / .25)}
+.thread-q{border-top:1px solid #e3e9e4;margin-top:10px;padding-top:6px;color:#23674e;font-weight:600;white-space:pre-wrap}
+main.linked #prompt:focus{outline-color:#23674e}
+table{border-collapse:collapse;margin:.4em 0;font-size:13px}th,td{border:1px solid #d7dfd8;padding:3px 8px;text-align:left;vertical-align:top}th{background:#f3f5f2}
+.note-source{font:12px/1.6 ui-monospace,Menlo,monospace;color:#63736c;white-space:pre}
+.note.current .note-line.drop-before{box-shadow:inset 0 2px #23674e}.note.current .note-line.drop-after{box-shadow:inset 0 -2px #23674e}  /* where dragged lines will land */

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>slide-tutor · {COURSE}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+<link rel="stylesheet" href="/static/style.css">
+<script defer src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
+<script type="module" src="/static/app.js"></script>
+</head>
+<body>
+<main>
+<section class="viewer">
+  <div class="toolbar">
+    <select id="lecture" aria-label="Lecture"></select>
+    <button id="prev" aria-label="Previous page">←</button>
+    <input id="page" type="number" min="1" value="1" aria-label="Page number"><span id="total"></span>
+    <button id="next" aria-label="Next page">→</button>
+    <span id="status" role="status"></span>
+    <input id="find" type="search" placeholder="Find in lecture  ⌘F" aria-label="Find in lecture"><span id="find-count"></span>
+  </div>
+  <div id="slide-box"><div id="page-wrap"><canvas id="slide"></canvas><div id="text-layer" class="textLayer"></div></div></div>
+</section>
+<section id="notes" aria-label="Notes"></section>
+<section id="response" aria-live="polite"><p class="empty">Answers appear here. ← → change slides.</p></section>
+<section class="composer">
+  <textarea id="prompt" placeholder="Ask about this slide…  (Enter = Ask, ↑↓ = history)"></textarea>
+  <div class="actions"><button id="ask">Ask</button><button id="check" title="Check this page's note (plus anything typed in the prompt)">Check note</button>
+    <details id="lang"><summary title="Languages and model">🌐</summary><div class="lang-menu">
+      <label>Model <select id="model"></select></label>
+      <label>Response <select id="response-lang"><option value="en">English</option><option value="zh">简体中文</option></select></label>
+      <label>Note <select id="note-lang"><option value="en">English</option><option value="zh">简体中文</option></select></label>
+    </div></details></div>
+</section>
+<button id="link" aria-pressed="false" disabled><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
+</main>
+</body></html>
