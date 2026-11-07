@@ -15,16 +15,19 @@
 <main>
 <section class="viewer">
   <div class="toolbar">
-    <select id="lecture" aria-label="Lecture"></select>
+    <div class="lecture-picker">
+      <button id="lecture" aria-label="Lecture" aria-haspopup="listbox" aria-expanded="false" aria-controls="lecture-list" disabled>Choose lecture</button>
+      <div id="lecture-list" role="listbox" aria-label="Lectures" tabindex="-1" hidden></div>
+    </div>
     <button id="prev" aria-label="Previous page">←</button>
     <input id="page" type="number" min="1" value="1" aria-label="Page number"><span id="total"></span>
     <button id="next" aria-label="Next page">→</button>
     <span id="status" role="status"></span>
     <input id="find" type="search" placeholder="Find in lecture  ⌘F" aria-label="Find in lecture"><span id="find-count"></span>
   </div>
-  <div id="slide-box"><div id="page-wrap"><canvas id="slide"></canvas><div id="text-layer" class="textLayer"></div></div></div>
+  <div id="slide-box" tabindex="0" role="region" aria-label="Slide reader. Arrow keys change pages."><div id="page-wrap"><canvas id="slide"></canvas><div id="text-layer" class="textLayer"></div></div></div>
 </section>
-<section id="notes" aria-label="Notes"></section>
+<section id="notes" aria-label="Notes" tabindex="0"></section>
 <section id="response" aria-live="polite"><p class="empty">Answers appear here. ← → change slides.</p></section>
 <section class="composer">
   <textarea id="prompt" placeholder="Ask about this slide…  (Enter = Ask, ↑↓ = history)"></textarea>

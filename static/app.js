@@ -1,7 +1,16 @@
+import {lineClipboardType, selectedLines, matchesCut, planPaste, commitClipboard} from './note-clipboard.mjs';
+import {mountLecturePicker} from './lecture-picker.mjs';
+import {noteAutoScroll} from './note-drag.mjs';
 import * as pdfjsLib from 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs';
+import {installNoteSyntax, mappedInline, rawFormula} from './note-format.mjs';
+import {mountNoteTools} from './note-tools.mjs';
+import {createNoteSaves, proposalText, offerBatch, noteValue} from './note-batch.mjs';
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
 const $ = id => document.getElementById(id);
 const state = {lecture: '', page: 1, total: 0, pdf: null, notes: {}, editLine: null, caret: null, renderGen: 0, busy: false, renderId: 0};
+const focusReader = () => $('slide-box').focus({preventScroll: true});
+const lecturePicker = mountLecturePicker({button: $('lecture'), list: $('lecture-list'), onSelect: loadLecture, focusReader});
+let lectureLoadId = 0;
 const mathOptions = {delimiters: [{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false},{left:'\\(',right:'\\)',display:false},{left:'\\[',right:'\\]',display:true}], throwOnError:false, strict:false, trust:false};
 
 // Scrolls only the panel. el.scrollIntoView would also scroll the overflow:hidden page, pushing the layout up.
@@ -12,6 +21,7 @@ function scrollPanel(panel, el, start = false) {
 }
 function status(text='') { $('status').textContent = text; }
 function markdown(el, text) {
+  installNoteSyntax(marked);
   // Protect math from Markdown's underscore/backslash processing before KaTeX sees it.
   const equations = [];
   const prefix = 'MATH' + Math.random().toString(36).slice(2) + 'TOKEN';
@@ -21,12 +31,45 @@ function markdown(el, text) {
   while (walker.nextNode()) equations.forEach((eq,i) => { walker.currentNode.textContent = walker.currentNode.textContent.replaceAll(`${prefix}${i}END`, () => eq); });
   renderMathInElement(el, mathOptions);
 }
-// Each note line is one step. A line without $ or `code` that looks like LaTeX renders as display math.
-function renderLine(line) {
+function noteMarkdown(el, text, offset) {
+  const heading = text.match(/^(#{1,6})\s+/);
+  const tag = heading ? `h${heading[1].length}` : 'p';
+  const prefix = heading ? heading[0].length : 0;
+  el.innerHTML = DOMPurify.sanitize(`<${tag}>${mappedInline(text.slice(prefix), offset + prefix, marked)}</${tag}>`);
+  renderMathInElement(el, mathOptions);
+}
+// Keep source-line boundaries for editing; indentation and markers carry the hierarchy.
+function noteLine(line) {
+  const indent = line.match(/^[ \t]*/)[0].replace(/\t/g, '    ').length;
+  const text = line.trimStart();
+  // A leading mathematical sign is not a list bullet. Use an explicit \\quad after a marker for formula list items.
+  const formula = /^[-+*]\s+/.test(text) && !/^[-+*]\s+\\quad\b/.test(text) && rawFormula(text);
+  const item = !formula && text.match(/^(\d+[.)]|[-+*])(?:\s+|(?=\\quad))(?:\\quad\s*)?(.*)$/);
+  return {indent, text: item ? item[2] : text, marker: item ? item[1] : null, prefix: line.length - (item ? item[2] : text).length};
+}
+function renderLine(line, offset = 0) {
+  const {indent, text, marker, prefix} = noteLine(line);
+  offset += prefix;
   const div = document.createElement('div'); div.className = 'note-line';
-  if (!line.trim()) { div.innerHTML = '&nbsp;'; return div; }
-  if (/[$`]/.test(line) || !/[\\^_]/.test(line)) { markdown(div, line); return div; }
-  try { katex.render(line, div, {displayMode: true, throwOnError: true, strict: false}); }
+  div.style.marginLeft = `${indent * .5}em`;
+  if (!text.trim()) { div.classList.add('note-gap'); div.innerHTML = '&nbsp;'; return div; }
+  if (marker) {
+    div.classList.add('note-item');
+    if (/^\d/.test(marker)) div.classList.add('note-ordered');
+    const label = document.createElement('span'); label.className = 'note-marker';
+    label.textContent = /^\d/.test(marker) ? marker : '•';
+    const content = renderLine(text, offset); content.classList.remove('note-line'); content.classList.add('note-content');
+    div.append(label, content); return div;
+  }
+  const formula = text;
+  line = text;
+  if (!rawFormula(formula)) {
+    noteMarkdown(div, line, offset); return div;
+  }
+  div.dataset.noteMath = 'true';
+  try {
+    katex.render(formula, div, {displayMode: true, throwOnError: true, strict: false});
+  }
   catch (error) {
     // Prose with an underscore (snake_case, __global__) or CJK text isn't broken LaTeX: show it as text.
     if (!line.includes('\\') || /[\u3400-\u9fff]/.test(line)) { div.textContent = line; return div; }
@@ -46,9 +89,13 @@ function blocks(lines) {
 }
 function renderBlock(lines, start, end) {
   if (end - start < 2) return renderLine(lines[start]);
-  const div = document.createElement('div'); div.className = 'note-line'; markdown(div, lines.slice(start, end).join('\n')); return div;
+  const div = document.createElement('div'); div.className = 'note-line';
+  div.style.marginLeft = `${noteLine(lines[start]).indent * .5}em`;
+  markdown(div, lines.slice(start, end).map(line => line.trimStart()).join('\n')); return div;
 }
-const renderLines = lines => blocks(lines).filter(([s, e]) => lines.slice(s, e).join('').trim()).map(([s, e]) => renderBlock(lines, s, e));
+const renderLines = lines => blocks(lines).map(([s, e]) => {
+  const block = renderBlock(lines, s, e); block.dataset.i = s; block.dataset.n = e - s; return block;
+});
 async function api(url, options={}) {
   const res = await fetch(url, options);
   if (!res.ok) { const body = await res.json().catch(() => ({})); throw new Error(typeof body.detail === 'string' ? body.detail : `Request failed (${res.status}).`); }
@@ -56,21 +103,40 @@ async function api(url, options={}) {
 }
 
 // ---- Notes: one document per lecture, a section per page; only the current page is editable.
-const saveTimers = new Map();  // per lecture+page, so switching pages never drops a pending save
-function saveNote(page = state.page, lecture = state.lecture) {
-  const key = `${lecture}:${page}`, text = state.notes[page] || '';
-  clearTimeout(saveTimers.get(key));
-  saveTimers.set(key, setTimeout(() => api(`/api/lectures/${lecture}/notes/${page}`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text})})
-    .then(() => status()).catch(error => status(`Note not saved: ${error.message}`)), 400));
+const savedNotes = new Map();
+function rememberSavedNotes(lecture, notes) {
+  for (const [page, text] of Object.entries(notes)) savedNotes.set(`${lecture}:${page}`, text);
 }
-function setNote(text) { state.notes[state.page] = text; saveNote(); }
+const saves = createNoteSaves(async (lecture, page, text) => {
+  const key = `${lecture}:${page}`, before = savedNotes.get(key) || '';
+  await api(`/api/lectures/${lecture}/notes/${page}`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text, before})});
+  savedNotes.set(key, text);
+}, error => status(`Note not saved: ${error.message}`));
+function saveNote(page = state.page, lecture = state.lecture) {
+  if (!state.noteTransaction) saves.save(lecture, page, state.notes[page] || '');
+}
+function lockNotes(locked) {
+  state.noteTransaction = locked;
+  $('notes').inert = locked || !!state.loading;
+  $('lecture').disabled = locked;
+  if (locked) { lecturePicker.close(); cancelNoteDrag(); }
+  refreshNoteActions();
+  if (locked) { undoNote = null; getSelection().removeAllRanges(); }
+}
+function setNote(text) {
+  if (state.noteTransaction || state.loading) return;
+  if (undoNote?.kind === 'format' && undoNote.after !== text) undoNote = null;
+  if (undoNote?.kind === 'clipboard' && undoNote.changes.some(change => change.page === state.page && noteValue(change.text) !== noteValue(text))) undoNote = null;
+  state.notes[state.page] = text; saveNote(); paintPendingCut();
+}
 function renderNotes() {
+  cancelNoteDrag();
   const pages = new Set(Object.keys(state.notes).filter(p => state.notes[p].trim()).map(Number));
   pages.add(state.page);
   state.renderGen++;  // editors from the previous render must ignore their blur
   $('notes').replaceChildren();
   for (const page of [...pages].sort((a, b) => a - b)) {
-    const section = document.createElement('div'); section.className = 'note' + (page === state.page ? ' current' : '');
+    const section = document.createElement('div'); section.className = 'note' + (page === state.page ? ' current' : ''); section.dataset.page = page;
     const head = document.createElement('button'); head.className = 'note-head'; head.textContent = `p.${page}`; head.onmousedown = event => { event.preventDefault(); goPage(page); };
     const body = document.createElement('div'); body.className = 'note-body';
     section.append(head, body); $('notes').append(section);
@@ -79,11 +145,35 @@ function renderNotes() {
     currentNote(body, text);
     scrollPanel($('notes'), section);
   }
+  paintPendingCut();
 }
-// Current page: every line stays rendered except the one being edited (click a line to edit only it).
+// Current page: a plain click edits the line; drags, double-clicks and clicks that clear a selection only select.
+const startEdit = i => { state.editLine = i; state.caret = null; renderNotes(); };
+let notePress = null, editTimer = 0;
+$('notes').addEventListener('pointerdown', event => {
+  clearTimeout(editTimer);
+  // Recorded before the browser collapses the selection; a textarea's own selection does not count.
+  const selection = getSelection();
+  const selected = !selection.isCollapsed && !!selection.toString() && $('notes').contains(selection.anchorNode) && !document.activeElement?.matches('textarea');
+  notePress = {x: event.clientX, y: event.clientY, selected};
+});
+$('notes').addEventListener('mousedown', event => { if (event.detail > 1) clearTimeout(editTimer); });
+function clickToEdit(div, at) {
+  div.onclick = event => {
+    const press = notePress; notePress = null;
+    if (!press || press.selected || event.detail > 1 || !getSelection().isCollapsed || event.target.closest('a,button,.note-drag')) return;
+    if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 4) return;
+    // Wait out a possible second click so double-click keeps native word selection.
+    const line = at(event), gen = state.renderGen;
+    clearTimeout(editTimer);
+    editTimer = setTimeout(() => {
+      if (gen === state.renderGen && state.editLine === null && getSelection().isCollapsed && !state.loading && !state.noteTransaction) startEdit(line);
+    }, 250);
+  };
+}
 function currentNote(body, text) {
   const lines = text ? text.split('\n') : [];
-  const edit = i => event => { event.preventDefault(); state.editLine = i; state.caret = null; renderNotes(); };
+  const edit = i => event => { event.preventDefault(); startEdit(i); };
   for (const [start, end] of blocks(lines)) {
     // A table being edited shows its other rows as source, so Enter and ↑/↓ work row by row.
     const source = end - start > 1 && state.editLine !== null && state.editLine >= start && state.editLine < end;
@@ -93,15 +183,21 @@ function currentNote(body, text) {
       if (source) { div = document.createElement('div'); div.className = 'note-line note-source'; div.textContent = lines[s]; }
       else div = renderBlock(lines, s, e);
       div.dataset.i = s; div.dataset.n = e - s;
-      // A plain click edits the line (in a table: the clicked row); a drag selects lines instead (see pickedLines). While editing, mousedown jumps straight to the line.
-      const at = event => { const row = event.target.closest('tr'); return row ? s + (row.rowIndex && row.rowIndex + 1) : s; };
-      div.onmousedown = event => { if (state.editLine !== null) edit(at(event))(event); };
-      div.onclick = event => { if (getSelection().isCollapsed) edit(at(event))(event); };
-      body.append(div);
+      // In a table, the clicked row (rows after the header skip the | --- | separator line).
+      body.append(noteRow(div, event => { const row = event.target.closest('tr'); return row ? s + (row.rowIndex && row.rowIndex + 1) : s; }));
     }
   }
   if (state.editLine !== null && state.editLine >= lines.length) lineEditor(body, lines, lines.length);
   else { const add = document.createElement('div'); add.className = 'note-add'; add.textContent = lines.length ? '+ line' : `Click to write a note for p.${state.page}… (LaTeX lines render as math)`; add.onmousedown = edit(lines.length); body.append(add); }
+}
+// The drag handle sits in the gutter and shows only beside selected lines.
+function noteRow(div, at) {
+  const row = document.createElement('div'); row.className = 'note-row';
+  const handle = document.createElement('span'); handle.className = 'note-drag';
+  handle.textContent = '⠿'; handle.draggable = true; handle.title = 'Drag selected lines to move';
+  handle.setAttribute('aria-label', handle.title);
+  clickToEdit(div, at);
+  row.append(handle, div); return row;
 }
 function lineEditor(body, lines, i) {
   const area = document.createElement('textarea'); area.rows = 1; area.value = lines[i] ?? '';
@@ -121,9 +217,27 @@ function lineEditor(body, lines, i) {
     else if (event.key === 'Escape') area.blur();
     else if (event.key === 'Tab') { event.preventDefault(); area.setRangeText('  ', at, area.selectionEnd, 'end'); area.oninput(); }
   };
-  area.onblur = () => {
+  area.onblur = event => {
     if (gen !== state.renderGen) return;
-    state.editLine = null; setNote(lines.join('\n').replace(/\n+$/, '')); renderNotes();
+    state.editLine = null; setNote(lines.join('\n').replace(/\n+$/, ''));
+    if (event.relatedTarget !== $('notes')) { renderNotes(); return; }
+    // Do not rebuild the line under a new text-selection gesture on blur.
+    if (i < (state.notes[state.page] || '').split('\n').length && state.notes[state.page]) {
+      const div = renderLine(lines[i] || ''); div.dataset.i = i; div.dataset.n = 1;
+      area.replaceWith(noteRow(div, () => i));
+    } else area.remove();
+    if (!body.querySelector('.note-add')) {
+      const add = document.createElement('div'); add.className = 'note-add'; add.textContent = '+ line';
+      add.onmousedown = event => { event.preventDefault(); move(state.notes[state.page] ? state.notes[state.page].split('\n').length : 0, null); };
+      body.append(add);
+    }
+    // Reassemble table source rows once there is no live text selection to preserve.
+    // A click on a line may still become an edit, so wait for it before rebuilding the DOM under the click.
+    if (body.querySelector('.note-source')) body.onpointerup = event => {
+      if (event.target.closest('button,.note-add,.note-drag')) return;
+      const gen = state.renderGen, reassemble = () => { if (gen === state.renderGen && state.editLine === null && getSelection().isCollapsed) renderNotes(); };
+      if (event.target.closest('.note-line')) setTimeout(reassemble, 300); else reassemble();
+    };
   };
   // Focus synchronously: keys typed right after Enter must land in the new line, not be dropped.
   body.append(area); grow(); area.focus();
@@ -132,11 +246,19 @@ function lineEditor(body, lines, i) {
 
 // Drag across rendered lines of the current note to select them: Backspace/Delete removes every line the
 // selection touches, ⌘X / ⌘C cut / copy them as source, dragging the selection moves them, ⌘Z undoes the last delete or move.
-let undoNote = null, pickedHint = false;
+let undoNote = null, pickedHint = false, pendingCut = null;
+mountNoteTools({state, setNote, renderNotes, status, getUndo: () => undoNote, setUndo: value => { undoNote = value; }, track});
 function pickedDivs() {
   const selection = getSelection(), body = document.querySelector('.note.current .note-body');
   if (!body || state.editLine !== null || !selection.rangeCount || selection.isCollapsed || !$('notes').contains(selection.getRangeAt(0).commonAncestorContainer)) return [];
-  return [...body.querySelectorAll('.note-line')].filter(div => selection.containsNode(div, true));
+  const range = selection.getRangeAt(0);
+  return [...body.querySelectorAll('.note-line')].filter(div => {
+    if (!range.intersectsNode(div)) return false;
+    const part = document.createRange(); part.selectNodeContents(div);
+    if (range.comparePoint(part.startContainer, part.startOffset) < 0) part.setStart(range.startContainer, range.startOffset);
+    if (range.comparePoint(part.endContainer, part.endOffset) > 0) part.setEnd(range.endContainer, range.endOffset);
+    return !part.collapsed && part.toString().length > 0;
+  });
 }
 const pickedLines = () => pickedDivs().flatMap(div => Array.from({length: Number(div.dataset.n)}, (_, k) => Number(div.dataset.i) + k));
 function deletePicked(picked) {
@@ -151,23 +273,103 @@ document.addEventListener('selectionchange', () => {
   const picked = pickedLines();
   document.querySelectorAll('.note-line.picked').forEach(div => div.classList.remove('picked'));
   for (const div of pickedDivs()) div.classList.add('picked');
-  if (picked.length) status(`${picked.length} line${picked.length > 1 ? 's' : ''} selected — drag to move, Backspace to delete`);
-  else if (pickedHint) status();
+  for (const row of document.querySelectorAll('.note-row')) row.classList.toggle('has-picked', !!row.querySelector('.picked'));
+  if (picked.length) status(`${picked.length} line${picked.length > 1 ? 's' : ''} selected — drag the ⠿ handle to move, Backspace to delete`);
+  else if (pickedHint) status(pendingCut ? 'Cut pending — paste into a note to move; Escape to cancel.' : '');
   pickedHint = picked.length > 0;
 });
+function paintPendingCut() {
+  if (pendingCut && (pendingCut.lecture !== state.lecture || pendingCut.before !== (state.notes[pendingCut.page] || ''))) {
+    pendingCut = null; status('Pending cut cancelled: source changed. Clipboard text is still available as a copy.');
+  }
+  for (const section of $('notes').querySelectorAll('.note')) {
+    for (const line of section.querySelectorAll('.note-line[data-i]')) {
+      const i = Number(line.dataset.i), n = Number(line.dataset.n);
+      const pending = !!pendingCut && Number(section.dataset.page) === pendingCut.page && i < pendingCut.end && i + n > pendingCut.first;
+      line.classList.toggle('cut-pending', pending);
+      line.title = pending ? 'Pending cut — removed only after pasting into a note. Escape cancels.' : '';
+    }
+  }
+}
+function cancelPendingCut(message = '') {
+  if (!pendingCut) return;
+  pendingCut = null; paintPendingCut(); if (message) status(message);
+}
 for (const type of ['copy', 'cut']) document.addEventListener(type, event => {
-  const picked = pickedLines(); if (!picked.length) return;
-  const lines = state.notes[state.page].split('\n');
-  event.preventDefault(); event.clipboardData.setData('text/plain', picked.map(i => lines[i]).join('\n'));
-  if (type === 'cut') deletePicked(picked);
+  const picked = pickedLines();
+  if (state.loading || state.noteTransaction) { if (picked.length) event.preventDefault(); return; }
+  cancelPendingCut('Pending cut cancelled; source lines were kept.');
+  if (!picked.length || !event.clipboardData) return;  // ordinary input clipboard behavior stays native
+  const before = state.notes[state.page] || '', selection = selectedLines(before, picked);
+  event.preventDefault(); event.clipboardData.setData('text/plain', selection.text);
+  if (type !== 'cut') return;
+  const token = crypto.randomUUID();
+  try { event.clipboardData.setData(lineClipboardType, token); } catch {}  // unsupported custom types safely degrade to Copy
+  if (event.clipboardData.getData(lineClipboardType) !== token) return status('Copied lines; this browser cannot mark a deferred cut.');
+  pendingCut = {...selection, before, lecture: state.lecture, page: state.page, token};
+  getSelection().removeAllRanges(); paintPendingCut(); $('notes').focus({preventScroll: true});
+  status(`Cut ${picked.length} line${picked.length === 1 ? '' : 's'} — paste into a note to move; Escape to cancel.`);
+  track('note_lines_cut_pending', {lines: picked});
+});
+const clipboardWrites = {state, api, saves, lock: lockNotes, onSaved: rememberSavedNotes, renderNotes};
+document.addEventListener('paste', async event => {
+  const editor = event.target.closest?.('.note.current textarea'), picked = pickedLines();
+  if (!editor && event.target.closest?.('input,textarea,[contenteditable="true"]')) return;
+  if (!$('notes').contains(event.target) && !picked.length) return;
+  if (state.loading || state.noteTransaction) { event.preventDefault(); return; }
+  const text = event.clipboardData?.getData('text/plain');
+  if (!text) return;
+  const cut = matchesCut(pendingCut, state.lecture, state.notes, event.clipboardData.getData(lineClipboardType), text) ? pendingCut : null;
+  if (pendingCut && !cut) cancelPendingCut('Clipboard or source changed; pasting a copy.');
+  if (editor && !cut) return;  // retain native caret/Undo behavior for normal editor pastes
+  event.preventDefault();
+  const lecture = state.lecture, page = state.page, before = state.notes[page] || '';
+  let target = null;
+  if (editor) {
+    const offset = before.split('\n').slice(0, state.editLine).reduce((n, line) => n + line.length + 1, 0);
+    // The '+ line' editor is not in the saved source until input: paste there as a line append.
+    if (offset <= before.length) target = {start: offset + editor.selectionStart, end: offset + editor.selectionEnd};
+  } else if (picked.length) {
+    const selected = selectedLines(before, picked); target = {start: selected.start, end: selected.contentEnd};
+  }
+  const previousUndo = undoNote;
+  try {
+    const changes = planPaste({notes: state.notes, page, text, target, cut});
+    const committed = await commitClipboard(changes, clipboardWrites);
+    cancelPendingCut(); getSelection().removeAllRanges();
+    undoNote = committed.length ? {kind: 'clipboard', lecture, changes: committed} : previousUndo;
+    $('notes').focus({preventScroll: true});
+    status(committed.length ? `${cut ? 'Moved' : 'Pasted'} note lines to p.${page} — ⌘Z / Ctrl+Z to undo.` : 'Lines are already at that destination.');
+    if (committed.length) track('note_clipboard_pasted', {pages: committed.map(change => change.page), moved: !!cut});
+  } catch (error) { undoNote = previousUndo; status(`Nothing pasted: ${error.message}`); }
+});
+async function undoClipboard(transaction) {
+  try {
+    await commitClipboard(transaction.changes.map(change => ({page: change.page, before: change.text, text: change.before})), clipboardWrites);
+    undoNote = null; cancelPendingCut();
+    status('Clipboard paste undone.'); track('note_clipboard_undone', {pages: transaction.changes.map(change => change.page)});
+  } catch (error) { undoNote = transaction; status(`Nothing undone: ${error.message}`); }
+}
+$('notes').addEventListener('pointerdown', event => {
+  if (!event.target.closest('textarea,button,a')) $('notes').focus({preventScroll: true});
 });
 
 // Dragging the picked lines: the drop point is the gap above or below the line under the pointer.
-let dragged = null;
+let dragged = null, dragSource = null;
+const dragScroll = noteAutoScroll($('notes'), (x, y) => markDrop(dropIndex({target: document.elementFromPoint(x, y), clientY: y})));
+function cancelNoteDrag() {
+  dragged = dragSource = null; dragScroll.stop(); markDrop(null); $('notes').classList.remove('moving-lines');
+}
+$('notes').addEventListener('pointerdown', event => {
+  dragSource = null;
+  const row = event.target.closest('.note-drag')?.closest('.note-row');
+  if (event.button !== 0 || !row?.querySelector('.picked') || state.editLine !== null || state.loading || state.noteTransaction) return;
+  dragSource = {picked: pickedLines(), lecture: state.lecture, page: state.page, text: state.notes[state.page]};
+});
 function dropIndex(event) {
   const body = document.querySelector('.note.current .note-body');
-  if (!body?.contains(event.target)) return null;
-  const div = event.target.closest('.note-line[data-i]');
+  if (!event.target || !body?.contains(event.target)) return null;
+  const div = event.target.closest('.note-row')?.querySelector('.note-line[data-i]') || event.target.closest('.note-line[data-i]');
   if (!div) return (state.notes[state.page] || '').split('\n').length;  // "+ line" or empty space: the end
   const {top, height} = div.getBoundingClientRect(), i = Number(div.dataset.i);
   return event.clientY < top + height / 2 ? i : i + Number(div.dataset.n);
@@ -180,19 +382,26 @@ function markDrop(index) {
   if (below) below.classList.add('drop-before'); else divs.at(-1)?.classList.add('drop-after');
 }
 document.addEventListener('dragstart', event => {
-  const picked = pickedLines(); if (!picked.length) return;
-  dragged = picked; event.dataTransfer.effectAllowed = 'move';
-  event.dataTransfer.setData('text/plain', picked.map(i => state.notes[state.page].split('\n')[i]).join('\n'));
+  if (!event.target.closest?.('.note-drag') || !dragSource?.picked.length || state.loading || state.noteTransaction ||
+      dragSource.lecture !== state.lecture || dragSource.page !== state.page || dragSource.text !== state.notes[state.page]) {
+    if (event.target.closest?.('.note.current')) event.preventDefault();
+    return;
+  }
+  dragged = dragSource.picked; $('notes').classList.add('moving-lines'); event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', dragged.map(i => dragSource.text.split('\n')[i]).join('\n'));
 });
-document.addEventListener('dragover', event => {
+for (const type of ['dragenter', 'dragover']) document.addEventListener(type, event => {
   if (!dragged) return;
+  dragScroll.move(event.clientX, event.clientY);
   const index = dropIndex(event); markDrop(index);
   if (index !== null) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }
 });
+$('notes').addEventListener('dragleave', event => { if (!$('notes').contains(event.relatedTarget)) dragScroll.stop(); });
 document.addEventListener('drop', event => {
   if (!dragged) return;
   event.preventDefault();
-  const index = dropIndex(event), picked = dragged; dragged = null; markDrop(null);
+  const index = dropIndex(event), picked = dragged, source = dragSource; cancelNoteDrag();
+  if (state.loading || state.noteTransaction || source.lecture !== state.lecture || source.page !== state.page || source.text !== state.notes[state.page]) return;
   if (index === null || (index >= picked[0] && index <= picked.at(-1) + 1)) return;  // dropped onto itself
   const text = state.notes[state.page], lines = text.split('\n');
   const moving = picked.map(i => lines[i]), rest = lines.filter((_, i) => !picked.includes(i));
@@ -202,7 +411,10 @@ document.addEventListener('drop', event => {
   status(`Moved ${picked.length} line${picked.length > 1 ? 's' : ''} — ⌘Z to undo`);
   track('note_lines_moved', {lines: moving, to: index});
 });
-document.addEventListener('dragend', () => { dragged = null; markDrop(null); });
+document.addEventListener('dragend', cancelNoteDrag);
+document.addEventListener('keydown', event => { if (event.key === 'Escape') cancelNoteDrag(); });
+window.addEventListener('blur', cancelNoteDrag);
+document.addEventListener('visibilitychange', () => { if (document.hidden) cancelNoteDrag(); });
 
 // ---- Slides
 async function slideCanvas(pdf, pageNumber, width) {
@@ -213,18 +425,24 @@ async function slideCanvas(pdf, pageNumber, width) {
   return canvas;
 }
 async function goPage(value) {
-  if (!state.pdf) return;
-  const number = Math.trunc(Number(value)), before = state.page;
+  if (!state.pdf || state.loading || state.noteTransaction) return;
+  const number = Math.trunc(Number(value)), before = state.page, pdf = state.pdf;
   state.page = Math.max(1, Math.min(state.total, Number.isFinite(number) ? number : state.page));
-  $('page').value = state.page; state.editLine = null; renderNotes();
-  if (linked && state.page !== before) unlink();  // a follow-up thread stays on one page
-  localStorage.setItem('slide-tutor-position', JSON.stringify({lecture: state.lecture, page: state.page}));
-  const id = ++state.renderId;
-  const [canvas, pdfPage] = await Promise.all([slideCanvas(state.pdf, state.page, 2000), state.pdf.getPage(state.page)]);
-  const text = await pdfPage.getTextContent();
-  if (id !== state.renderId) return;
-  $('slide').width = canvas.width; $('slide').height = canvas.height; $('slide').getContext('2d').drawImage(canvas, 0, 0);
-  Object.assign(state, {pdfPage, text}); layoutSlide();
+  const page = state.page, id = ++state.renderId;
+  $('page').value = page; state.editLine = null; renderNotes();
+  if (linked && page !== before) unlink();
+  updateLink(); refreshNoteActions();
+  localStorage.setItem('slide-tutor-position', JSON.stringify({lecture: state.lecture, page}));
+  try {
+    const [canvas, pdfPage] = await Promise.all([slideCanvas(pdf, page, 2000), pdf.getPage(page)]);
+    const text = await pdfPage.getTextContent();
+    if (id !== state.renderId || pdf !== state.pdf) return;
+    $('slide').width = canvas.width; $('slide').height = canvas.height; $('slide').getContext('2d').drawImage(canvas, 0, 0);
+    Object.assign(state, {pdfPage, text}); layoutSlide();
+    if ($('find').value) find(0, false);
+  } catch (error) {
+    if (id === state.renderId && pdf === state.pdf) status(`Could not display page: ${error.message}`);
+  }
 }
 // Fit the slide into its box and lay pdf.js's invisible text layer over it so slide text is selectable.
 let textLayer = null;
@@ -244,16 +462,38 @@ function layoutSlide() {
 }
 new ResizeObserver(layoutSlide).observe($('slide-box'));
 async function loadLecture(lecture, page = 1) {
+  if (state.noteTransaction) return;
+  cancelNoteDrag();
+  const id = ++lectureLoadId;
+  state.loading = true; state.renderId++;
+  $('notes').inert = true; refreshNoteActions();
   status('Loading…');
+  let task;
   try {
-    const [pdf, notes] = await Promise.all([pdfjsLib.getDocument(`/slides/${lecture}.pdf`).promise, api(`/api/lectures/${lecture}/notes`).then(r => r.json())]);
-    state.pdf?.destroy();
-    Object.assign(state, {pdf, lecture, total: pdf.numPages, notes});
-    $('lecture').value = lecture; $('page').max = pdf.numPages; $('total').textContent = `/ ${pdf.numPages}`;
+    await saves.flush();
+    if (id !== lectureLoadId) return;
+    task = pdfjsLib.getDocument(`/slides/${lecture}.pdf`);
+    const [pdf, notes] = await Promise.all([task.promise, api(`/api/lectures/${lecture}/notes`).then(r => r.json())]);
+    if (id !== lectureLoadId) { await task.destroy(); return; }
+    const previous = state.pdf;
+    rememberSavedNotes(lecture, Object.fromEntries(Array.from({length: pdf.numPages}, (_, i) => [i + 1, notes[i + 1] || ''])));
+    Object.assign(state, {pdf, lecture, total: pdf.numPages, notes, pdfPage: null, loading: false});
+    lecturePicker.select(lecture); $('page').max = pdf.numPages; $('total').textContent = `/ ${pdf.numPages}`;
+    previous?.destroy();
     if (linked) unlink();
     status(); await goPage(page);
-    if ($('find').value) find(0, false);
-  } catch (error) { status(`Could not load lecture: ${error.message}`); }
+    if (id === lectureLoadId && $('find').value) find(0, false);
+  } catch (error) {
+    if (task) await task.destroy().catch(() => {});
+    if (id === lectureLoadId) {
+      lecturePicker.select(state.lecture);
+      status(`Could not load lecture: ${error.message}`);
+    }
+  } finally {
+    if (id === lectureLoadId) {
+      state.loading = false; $('notes').inert = !!state.noteTransaction; refreshNoteActions();
+    }
+  }
 }
 
 // ---- Find (⌘F): search every page of the lecture; Enter / Shift+Enter jump to the next / previous matching page.
@@ -293,9 +533,10 @@ $('find').addEventListener('keydown', event => {
 const history = JSON.parse(localStorage.getItem('slide-tutor-prompts') || '[]');
 let historyIndex = history.length, pending = '';
 async function send(mode) {
-  if (state.busy || !state.pdf) return;
+  if (state.busy || state.loading || state.noteTransaction || !state.pdf) return;
   const text = $('prompt').value.trim();
-  const {lecture, page} = state, note = state.notes[page] || '';
+  const {lecture, page, pdf} = state;
+  let note = state.notes[page] || '';
   if (mode === 'ask' && !text) return status('Type a question first.');
   if (mode === 'check' && !note.trim()) return status('Write a note for this page first.');
   if (text) {  // Check also sends whatever is typed (e.g. "is step 3 right?")
@@ -304,17 +545,24 @@ async function send(mode) {
     historyIndex = history.length; pending = ''; $('prompt').value = '';
   }
   const follow = linked;  // linked: keep the thread on screen and send it along
+  const priorThread = follow ? thread.slice() : [];
   state.busy = true; $('ask').disabled = $('check').disabled = true; updateLink(); status(`Thinking about p.${page}…`);
-  if (!follow) { $('response').replaceChildren(); Object.assign($('response').dataset, {lecture, page}); }  // whose note a selection goes to
-  let answer = '', frame = null;
+  if (!follow) {
+    const applied = [...$('response').querySelectorAll('.note-proposal[data-applied="true"]')];
+    $('response').replaceChildren(...applied); Object.assign($('response').dataset, {lecture, page});
+  }  // Preserve applied batch Undo controls when replacing the answer.
+  let answer = '', frame = null, proposal = null, completed = false;
   const q = document.createElement('div'), out = document.createElement('div');
   if (follow) { q.className = 'thread-q'; q.textContent = `↳ ${mode === 'check' ? `Check note${text ? `: ${text}` : ''}` : text}`; $('response').append(q); scrollPanel($('response'), q, true); }
   $('response').append(out);
   try {
+    await saves.flush();
+    if (state.lecture !== lecture || state.page !== page) throw new Error('Page changed; send the request again.');
+    note = state.notes[page] || '';
     // Neighbors go as extracted text (server side); the model gets image_hires only if it asks for it.
-    const image = (await slideCanvas(state.pdf, page, 1000)).toDataURL('image/png');
-    const image_hires = (await slideCanvas(state.pdf, page, 1600)).toDataURL('image/png');
-    const res = await api('/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({lecture, page, mode, text, note, image, image_hires, response_lang: $('response-lang').value, note_lang: $('note-lang').value, model: $('model').value || undefined, thread: follow ? thread : []})});
+    const image = (await slideCanvas(pdf, page, 1000)).toDataURL('image/png');
+    const image_hires = (await slideCanvas(pdf, page, 1600)).toDataURL('image/png');
+    const res = await api('/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({lecture, page, mode, text, note, image, image_hires, response_lang: $('response-lang').value, note_lang: $('note-lang').value, model: $('model').value || undefined, thread: priorThread})});
     const reader = res.body.getReader(), decoder = new TextDecoder(); let buffer = '';
     for (;;) {
       const {value, done} = await reader.read(); if (done) break;
@@ -325,33 +573,45 @@ async function send(mode) {
         const item = JSON.parse(record.slice(6));
         if (item.type === 'error') throw new Error(item.message);
         if (item.type === 'status') status(item.message);
-        if (item.type === 'delta') { answer += item.text; frame ??= setTimeout(() => { frame = null; markdown(out, answer); }, 80); }
+        if (item.type === 'proposal') proposal = item.proposal;
+        if (item.type === 'done') completed = true;
+        if (item.type === 'delta') { answer += item.text; frame ??= setTimeout(() => { frame = null; markdown(out, proposalText(answer)); }, 80); }
       }
     }
-    clearTimeout(frame); status();
+    clearTimeout(frame);
+    if (!completed) throw new Error('Response ended early. No note changes are available.');
+    status();
+    if (proposal) {
+      markdown(out, proposalText(answer));
+      offerBatch(proposal, {state, container: $('response'), api, saves, renderNotes, status, goPage, track, lock: lockNotes, onSaved: rememberSavedNotes});
+      thread = [...priorThread, {mode, question: text, answer: proposalText(answer)}].slice(-4);
+      return;
+    }
+    if (answer.includes('```note-proposal')) throw new Error('No validated note proposal was received. Nothing was applied.');
     // Check → ```latex block replaces the note; Ask → optional ```note block is a suggestion appended to it.
     // A follow-up in a thread that started with a check may also return the whole edited note as ```latex.
-    const editing = mode === 'check' || (follow && thread.some(t => t.mode === 'check'));
+    const editing = mode === 'check' || (follow && priorThread.some(t => t.mode === 'check'));
     const fixed = editing && answer.match(/```latex\s*\n([\s\S]*?)```/i);
     const suggested = mode === 'ask' && answer.match(/```note\s*\n([\s\S]*?)```\s*$/i);
     markdown(out, suggested ? answer.slice(0, suggested.index) : answer);
     // Questions and checks can both be followed up on (a check keeps its ```latex block so edits can build on it).
-    thread = [...(follow ? thread : []), {mode, question: text, answer: suggested ? answer.slice(0, suggested.index) : answer}].slice(-4);
-    if (fixed) offerApply(fixed[1].trim(), lecture, page, 'replace');
+    thread = [...priorThread, {mode, question: text, answer: suggested ? answer.slice(0, suggested.index) : answer}].slice(-4);
+    if (fixed) offerApply(fixed[1].trim(), lecture, page, 'replace', note);
     if (suggested) {
       const box = document.createElement('div'); box.className = 'suggested';
-      const label = document.createElement('div'); label.className = 'suggested-label'; label.textContent = 'Suggested note';
+      const label = document.createElement('div'); label.className = 'suggested-label'; label.textContent = 'Suggested note — add to the currently open page';
       box.append(label, ...renderLines(suggested[1].trim().split('\n')));
       $('response').append(box); offerApply(suggested[1].trim(), lecture, page, 'append');
     }
-  } catch (error) { clearTimeout(frame); if (answer) markdown(out, answer); else { q.remove(); out.remove(); } status(error.message); }
+  } catch (error) { clearTimeout(frame); if (answer) markdown(out, proposalText(answer)); else { q.remove(); out.remove(); } status(error.message); }
   finally { state.busy = false; $('ask').disabled = $('check').disabled = false; updateLink(); }
 }
 // 🔗 between response and prompt: on = the next question follows up on the answers shown (last 4 Q&A sent as text).
 let thread = [], linked = false;
 function updateLink() {
-  if (!thread.length) linked = false;
-  const link = $('link'); link.disabled = state.busy || !thread.length; link.setAttribute('aria-pressed', linked);
+  const sameContext = $('response').dataset.lecture === state.lecture && Number($('response').dataset.page) === state.page;
+  if (!thread.length || !sameContext) linked = false;
+  const link = $('link'); link.disabled = state.busy || state.loading || !thread.length || !sameContext; link.setAttribute('aria-pressed', linked);
   $('check').title = linked ? "Check the note again as part of this thread (plus anything typed)" : "Check this page's note (plus anything typed in the prompt)";
   link.title = !thread.length ? 'Follow up: ask something first' : linked ? 'Linked: next question follows up on the answers above (click to unlink)' : 'Link: make the next question a follow-up to this answer';
   document.querySelector('main').classList.toggle('linked', linked);
@@ -360,25 +620,46 @@ function updateLink() {
 function unlink() { linked = false; thread = thread.slice(-1); updateLink(); }  // keep the last answer so it can be re-linked
 $('link').onclick = () => { if (linked) unlink(); else { linked = true; updateLink(); } track(linked ? 'link_on' : 'link_off'); $('prompt').focus(); };
 // Silent usage log (data/logs/events.jsonl, see CLAUDE.md); failures are ignored.
-function track(kind, data = {}) {
+function track(kind, data = {}, destination = {lecture: state.lecture, page: state.page}) {
   fetch('/api/event', {method: 'POST', headers: {'Content-Type': 'application/json'}, keepalive: true,
-    body: JSON.stringify({kind, lecture: state.lecture, page: state.page, data})}).catch(() => {});
+    body: JSON.stringify({kind, ...destination, data})}).catch(() => {});
 }
-function offerApply(text, lecture, page, how) {
-  const apply = document.createElement('button'); apply.className = 'apply'; apply.textContent = `${how === 'append' ? 'Add' : 'Apply'} to note p.${page}`;
-  const undo = document.createElement('button'); undo.className = 'apply'; undo.textContent = 'Undo'; undo.hidden = true;
-  let previous = null;
+function refreshNoteActions() {
+  for (const button of $('response').querySelectorAll('.apply')) button.updateNoteAction?.();
+}
+function offerApply(text, lecture, page, how, sourceNote = state.notes[page] || '') {
+  const apply = document.createElement('button'); apply.className = 'apply';
+  const undo = document.createElement('button'); undo.className = 'apply'; undo.hidden = true;
+  let destination = null, previous = '', after = '';
+  const samePage = (l, p) => state.lecture === l && state.page === p;
+  apply.updateNoteAction = () => {
+    apply.textContent = how === 'append' ? `Add to current page (p.${state.page})` : `Apply to note p.${page}`;
+    apply.title = how === 'append' ? 'Append this suggestion to the currently open page, keeping its existing note.' : `Replace the original note on ${lecture}, p.${page}.`;
+    apply.disabled = !!(state.noteTransaction || state.loading || !state.lecture || (how !== 'append' && !samePage(lecture, page)));
+  };
+  undo.updateNoteAction = () => {
+    undo.textContent = destination ? `Undo on ${destination.lecture}, p.${destination.page}` : 'Undo';
+    undo.disabled = !!(state.noteTransaction || state.loading || !destination || !samePage(destination.lecture, destination.page));
+  };
   apply.onclick = () => {
-    if (state.lecture !== lecture || state.page !== page) return status(`Go back to p.${page} to apply.`);
-    previous = state.notes[page] || ''; setNote(how === 'append' && previous.trim() ? `${previous.trimEnd()}\n${text}` : text); state.editLine = null; renderNotes(); apply.hidden = true; undo.hidden = false;
+    if (state.noteTransaction || state.loading || !state.lecture) return;
+    if (how !== 'append' && !samePage(lecture, page)) return status(`Go back to ${lecture}, p.${page} to apply.`);
+    if (how !== 'append' && (state.notes[page] || '') !== sourceNote) return status('Note changed since this answer. Check it again before replacing.');
+    destination = {lecture: state.lecture, page: state.page};
+    previous = state.notes[state.page] || '';
+    after = how === 'append' && previous.trim() ? `${previous.trimEnd()}\n${text}` : text;
+    setNote(after); state.editLine = null; renderNotes(); apply.hidden = true; undo.hidden = false;
+    refreshNoteActions();
     track(how === 'append' ? 'suggested_note_added' : 'check_fix_applied', {text});
   };
   undo.onclick = () => {
-    if (state.lecture !== lecture || state.page !== page) return status(`Go back to p.${page} to undo.`);
-    setNote(previous); renderNotes(); undo.hidden = true; apply.hidden = false;
+    if (state.noteTransaction || state.loading || !destination) return;
+    if (!samePage(destination.lecture, destination.page)) return status(`Go back to ${destination.lecture}, p.${destination.page} to undo.`);
+    if ((state.notes[destination.page] || '') !== after) return status('Note changed after applying. Undo would overwrite your edits; nothing changed.');
+    setNote(previous); renderNotes(); undo.hidden = true; apply.hidden = false; refreshNoteActions();
     track(how === 'append' ? 'suggested_note_undone' : 'check_fix_undone', {text});
   };
-  $('response').append(apply, undo);
+  $('response').append(apply, undo); refreshNoteActions();
 }
 
 // ---- Select part of the response → "Add to note" appends it (math as LaTeX source) to the note of the page it answered.
@@ -427,6 +708,7 @@ document.addEventListener('mouseup', event => {
 });
 document.addEventListener('selectionchange', () => { if (!selectionArea()) popup.hidden = true; });
 popup.onclick = () => {
+  if (state.noteTransaction || state.loading) return;
   const selection = getSelection();
   if (!selection.rangeCount) return;
   if (popup.dataset.area === 'response') {
@@ -435,7 +717,7 @@ popup.onclick = () => {
     if (lecture !== state.lecture) return status(`Go back to ${lecture} to add this.`);
     const text = selectionToNoteText(selection.getRangeAt(0));
     const note = (state.notes[page] || '').trimEnd();
-    if (text) { state.notes[page] = note ? `${note}\n${text}` : text; saveNote(Number(page)); state.editLine = null; renderNotes(); status(`Added to note p.${page}`); track('selection_added_to_note', {text, page: Number(page)}); }
+    if (text) { state.notes[page] = note ? `${note}\n${text}` : text; saveNote(Number(page)); state.editLine = null; renderNotes(); status(`Added to note p.${page}`); track('selection_added_to_note', {text}, {lecture, page: Number(page)}); }
   } else {
     // Sendable as-is, and reads naturally if the user keeps typing after it.
     const quote = selection.toString().replace(/\s+/g, ' ').trim();
@@ -451,6 +733,7 @@ popup.onclick = () => {
 $('ask').onclick = () => send('ask');
 $('check').onclick = () => send('check');
 $('prompt').addEventListener('keydown', event => {
+  if (event.isComposing || event.keyCode === 229) return;
   const area = event.target, before = area.value.slice(0, area.selectionStart), after = area.value.slice(area.selectionEnd);
   if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send('ask'); }
   else if (event.key === 'ArrowUp' && !before.includes('\n') && historyIndex > 0) {
@@ -470,16 +753,32 @@ api('/api/models').then(r => r.json()).then(({default: fallback, models}) => {
   $('model').value = models.some(m => m.id === langs.model) ? langs.model : fallback;
 }).catch(() => {});  // no list: requests use the server's default model
 document.addEventListener('mousedown', event => { if (!$('lang').contains(event.target)) $('lang').open = false; });
-$('lecture').onchange = event => loadLecture(event.target.value);
+$('slide-box').addEventListener('pointerdown', focusReader);
+$('page').addEventListener('keydown', event => { if (event.key === 'Escape') focusReader(); });
+$('prompt').addEventListener('keydown', event => { if (event.key === 'Escape' && !event.isComposing) focusReader(); });
 $('page').onchange = event => goPage(event.target.value);
 $('prev').onclick = () => goPage(state.page - 1);
 $('next').onclick = () => goPage(state.page + 1);
 document.addEventListener('keydown', event => {
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') { event.preventDefault(); $('find').focus(); $('find').select(); return; }
-  if (event.target.closest('input,textarea,select')) return;
+  if ((event.metaKey || event.ctrlKey) && !(event.metaKey && event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'f') { event.preventDefault(); $('find').focus(); $('find').select(); return; }
+  if (event.key === 'Escape' && pendingCut && !state.noteTransaction && !event.isComposing) {
+    event.preventDefault(); cancelPendingCut('Cut cancelled; source lines were kept.');
+  }
+  if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'z' && undoNote?.kind === 'clipboard' && undoNote.lecture === state.lecture && !state.loading && !state.noteTransaction && !event.isComposing) {
+    const input = event.target.closest('input,textarea,[contenteditable="true"]');
+    if (!input || (input.matches('.note.current textarea') && undoNote.changes.some(change => change.page === state.page))) {
+      event.preventDefault(); undoClipboard(undoNote); return;
+    }
+  }
+  if (event.isComposing || event.target.closest('input,textarea,select,[contenteditable="true"]')) return;
+  if (state.loading || state.noteTransaction) return;
   if (event.key === 'Backspace' || event.key === 'Delete') { const picked = pickedLines(); if (picked.length) { event.preventDefault(); deletePicked(picked); } return; }
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z' && undoNote?.lecture === state.lecture) {
-    event.preventDefault(); const {page, text} = undoNote; undoNote = null;
+  if (event.key === 'Enter' && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) {  // keyboard path into editing
+    const picked = pickedLines(); if (picked.length) { event.preventDefault(); getSelection().removeAllRanges(); startEdit(picked[0]); } return;
+  }
+  if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'z' && undoNote?.lecture === state.lecture && undoNote.kind !== 'clipboard') {
+    event.preventDefault(); const {page, text, after} = undoNote; undoNote = null;
+    if (after !== undefined && state.notes[page] !== after) return status('Note changed after formatting. Nothing was undone.');
     state.notes[page] = text; saveNote(page); renderNotes(); status(`Restored note p.${page}`); track('note_delete_undone'); return;
   }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -518,9 +817,10 @@ $('slide-box').addEventListener('wheel', event => {
 }, {passive: false});
 async function init() {
   const lectures = await (await api('/api/lectures')).json();
-  for (const l of lectures) $('lecture').append(new Option(l.label, l.id));
+  lecturePicker.setLectures(lectures);
+  if (!lectures.length) { status('No lectures found. Add lecture files to this course.'); return; }
   let saved = {}; try { saved = JSON.parse(localStorage.getItem('slide-tutor-position')) || {}; } catch {}
   await loadLecture(lectures.some(l => l.id === saved.lecture) ? saved.lecture : lectures[0].id, saved.page || 1);
 }
 // Classic CDN scripts must finish before Markdown / math rendering.
-if (document.readyState === 'complete') init(); else window.addEventListener('load', init, {once: true});
+if (document.readyState === 'complete') init().catch(error => status(error.message)); else window.addEventListener('load', () => init().catch(error => status(error.message)), {once: true});

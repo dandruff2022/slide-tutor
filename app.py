@@ -112,6 +112,19 @@ def read_notes(lecture):
     return {int(parts[i]): parts[i + 1].strip("\n") for i in range(1, len(parts) - 1, 2)}
 
 
+note_locks = {}
+note_locks_guard = threading.Lock()
+
+
+def note_lock(lecture):
+    with note_locks_guard:
+        return note_locks.setdefault(lecture, threading.Lock())
+
+
+def note_value(text):
+    return text.strip("\n") if text.strip() else ""
+
+
 def write_notes(lecture, notes):
     text = "".join(f"## p.{page}\n{body.strip(chr(10))}\n\n" for page, body in sorted(notes.items()) if body.strip())
     path = notes_path(lecture)
@@ -149,15 +162,57 @@ def get_notes(lecture: str):
 
 class Note(BaseModel):
     text: str = Field(default="", max_length=50000)
+    before: str | None = Field(default=None, max_length=50000)
 
 
 @app.put("/api/lectures/{lecture}/notes/{page}")
 def put_note(lecture: str, page: int, body: Note):
     checked_page(metadata(lecture), page)
-    notes = read_notes(lecture)
-    notes[page] = body.text
-    write_notes(lecture, notes)
+    if re.search(r"^## p\.\d+[ \t]*$", body.text, re.M):
+        raise HTTPException(422, "Page headings belong outside the note body.")
+    with note_lock(lecture):
+        notes = read_notes(lecture)
+        if body.before is not None and note_value(notes.get(page, "")) != note_value(body.before):
+            raise HTTPException(409, "Note changed on disk or in another tab. Copy your edits before reloading; nothing was saved.")
+        notes[page] = body.text
+        write_notes(lecture, notes)
     return {"ok": True}
+
+
+class NoteChange(BaseModel):
+    page: int = Field(strict=True)
+    before: str = Field(max_length=50000)
+    text: str = Field(max_length=50000)
+
+
+class NoteBatch(BaseModel):
+    changes: list[NoteChange] = Field(min_length=1, max_length=100)
+
+
+@app.post("/api/lectures/{lecture}/notes/batch")
+def batch_notes(lecture: str, body: NoteBatch):
+    meta = metadata(lecture)
+    pages = [change.page for change in body.changes]
+    if len(set(pages)) != len(pages):
+        raise HTTPException(422, "Duplicate note pages")
+    for change in body.changes:
+        checked_page(meta, change.page)
+        if re.search(r"^## p\.\d+[ \t]*$", change.text, re.M):
+            raise HTTPException(422, "Page headings belong outside the note body.")
+    with note_lock(lecture):
+        notes = read_notes(lecture)
+        conflicts = [c.page for c in body.changes if note_value(notes.get(c.page, "")) != note_value(c.before)]
+        if conflicts:
+            raise HTTPException(409, f"Notes changed on {', '.join(f'p.{p}' for p in conflicts)}. Nothing was applied; request a new proposal.")
+        path = notes_path(lecture)
+        backup = path.parent / "backups"
+        backup.mkdir(exist_ok=True)
+        backup = backup / f"{lecture}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex}.md"
+        # Back up the exact original file before the one atomic replacement. Failure leaves it untouched.
+        backup.write_bytes(path.read_bytes() if path.exists() else b"")
+        notes.update({c.page: c.text for c in body.changes})
+        write_notes(lecture, notes)
+    return {"ok": True, "notes": {p: note_value(notes[p]) for p in pages}}
 
 
 class Turn(BaseModel):
@@ -222,37 +277,92 @@ class UiEvent(BaseModel):
 
 @app.post("/api/event")
 def ui_event(body: UiEvent):
-    log(body.kind, lecture=body.lecture, page=body.page, **body.data)
+    fields = {**body.data, "lecture": body.lecture, "page": body.page}
+    fields.pop("kind", None)
+    log(body.kind, **fields)
     return {"ok": True}
 
 
-# A first reply made only of these asks for more input before answering (prompts/system.md):
-# [[HIRES]] = the 1600px slide, [[PAGES 3-9, 12]] / [[PAGES all]] = extracted text of those pages.
-WANT = r"\[\[(HIRES|PAGES [0-9a-z ,\-]+)\]\]"
-MAYBE_WANT = re.compile(r"\s*(?:\[(?:\[[A-Za-z0-9 ,\-]*(?:\]\]?)?)?\s*)*")  # could still become requests: hold it back
-EXTRA_TEXT_LIMIT = 120_000  # characters of requested page text
+# Request-only replies are hidden context lookups, never instructions to write notes.
+WANT = r"\[\[(HIRES|(?:PAGES|NOTES) [0-9a-z ,\-]+)\]\]"
+MAYBE_WANT = re.compile(r"\s*(?:\[(?:\[[A-Za-z0-9 ,\-]*(?:\]\]?)?)?\s*)*")
+EXTRA_TEXT_LIMIT = 120_000
+NOTE_CONTEXT_LIMIT = 120_000
+PROPOSAL = re.compile(r"^```note-proposal[ \t]*\n([\s\S]*?)^```[ \t]*$", re.M)
 
 
 def wants(answer, total):
-    """(hires, pages) if the reply is only requests, else None."""
+    """(hires, slide pages, note pages) if the reply consists only of valid requests."""
     if not re.fullmatch(rf"\s*(?:{WANT}\s*)+", answer):
         return None
-    hires, pages = False, set()
+    hires, pages, notes = False, set(), set()
     for item in re.findall(WANT, answer):
         if item == "HIRES":
             hires = True
-        for part in item[6:].split(",") if item.startswith("PAGES") else ():
+            continue
+        target = notes if item.startswith("NOTES") else pages
+        for part in item[6:].split(","):
             if part.strip() == "all":
-                pages |= set(range(1, total + 1))
+                target.update(range(1, total + 1))
             elif m := re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+))?\s*", part):
-                pages |= set(range(max(1, int(m[1])), min(total, int(m[2] or m[1])) + 1))
-    return hires, sorted(pages)
+                target.update(range(max(1, int(m[1])), min(total, int(m[2] or m[1])) + 1))
+            else:
+                return None
+    return hires, sorted(pages), sorted(notes)
 
 
-def build_content(body, meta, want=None):
-    """Per-page part first (texts, then the image) so it forms a cacheable prefix; the per-question part goes last.
-    `want` = (hires, pages) the model asked for in its first reply."""
-    hires, pages = want or (False, [])
+def note_index(notes, total):
+    lines = []
+    for page, text in sorted(notes.items()):
+        if 1 <= page <= total and text.strip():
+            heading = next((s.lstrip("# ")[:90] for s in text.splitlines() if s.strip()), "")
+            lines.append(f"p.{page}: {heading}")
+    return ("NOTE INDEX (headings only; not full notes, not edit authorization):\n" +
+            ("\n".join(lines)[:12000] or "[no saved notes]") + "\n\n")
+
+
+def parse_proposal(answer, body, meta, snapshots):
+    """Only complete, inspected replacements become reviewable; originals are server-owned."""
+    if "```note-proposal" not in answer:
+        return None
+    matches = list(PROPOSAL.finditer(answer))
+    if len(matches) != 1 or answer[matches[0].end():].strip():
+        raise ValueError("Incomplete or multiple note proposals")
+    value = json.loads(matches[0][1])
+    if not isinstance(value, dict) or value.get("scope") not in ("current", "multiple"):
+        raise ValueError("Invalid proposal scope")
+    summary, intent = value.get("summary"), value.get("intent", "")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 2000:
+        raise ValueError("Invalid proposal summary")
+    if not isinstance(intent, str) or len(intent) > 1000:
+        raise ValueError("Invalid intent quote")
+    if value["scope"] == "multiple" and (not intent.strip() or intent not in body.text):
+        raise ValueError("Cross-page intent must quote the current user's request")
+    changes = value.get("changes")
+    if not isinstance(changes, list) or not 1 <= len(changes) <= 100:
+        raise ValueError("Invalid proposal changes")
+    seen, checked = set(), []
+    for change in changes:
+        if not isinstance(change, dict):
+            raise ValueError("Invalid page replacement")
+        page, text = change.get("page"), change.get("text")
+        if type(page) is not int or not 1 <= page <= meta["pages"] or page in seen:
+            raise ValueError("Duplicate or invalid proposal page")
+        if page not in snapshots or (value["scope"] == "current" and page != body.page):
+            raise ValueError("Proposal includes an uninspected or out-of-scope note")
+        if not isinstance(text, str) or len(text) > 50000 or re.search(r"^## p\.\d+[ \t]*$", text, re.M):
+            raise ValueError("Invalid note replacement text")
+        seen.add(page)
+        checked.append({"page": page, "before": snapshots[page], "text": note_value(text)})
+    if sum(len(c["text"]) for c in checked) > NOTE_CONTEXT_LIMIT:
+        raise ValueError("Proposal exceeds note size limit")
+    return {"lecture": body.lecture, "scope": value["scope"], "intent": intent,
+            "summary": summary, "changes": checked}
+
+
+def build_content(body, meta, want=None, notes=None, snapshots=None, final_round=False):
+    """Keep slide text/image as a cacheable prefix; note lookups go on the question side."""
+    hires, pages = (want[0], want[1]) if want else (False, [])
     text = (f"User is viewing {label(body.lecture)}, page {body.page} of {meta['pages']}.\n"
             f"Noisy extracted text of the current page (trust the image for math):\n{meta['texts'][body.page - 1][:12000]}\n\n")
     for p in (body.page - 1, body.page + 1):
@@ -267,9 +377,13 @@ def build_content(body, meta, want=None):
             extra = extra[:EXTRA_TEXT_LIMIT] + "\n[truncated]\n"
         if pages:
             request += f"NOISY EXTRACTED TEXT OF THE REQUESTED PAGES (no images):\n{extra}\n"
-        request += "This is the follow-up to your request: answer now, without further [[...]] requests.\n\n"
-    if body.note.strip():
-        request += f"USER'S NOTE FOR THIS PAGE (work in progress, may be partial or wrong):\n{body.note}\n\n"
+        request += ("This is the follow-up to your request: answer now if sufficient; one more context lookup is allowed.\n\n"
+                    if not final_round else "Context lookup limit reached: answer now, without further [[...]] requests.\n\n")
+    request += note_index(notes or {}, meta["pages"])
+    for page, content in sorted((snapshots or {}).items()):
+        if page != body.page:
+            request += f"USER'S COMPLETE NOTE p.{page} (context only, not permission to edit):\n{content or '[empty note]'}\nEND NOTE p.{page}\n\n"
+    request += f"USER'S NOTE FOR THIS PAGE (work in progress, may be partial or wrong):\n{body.note or '[empty note]'}\n\n"
     names = {"en": "English", "zh": "Simplified Chinese"}
     request += (f"LANGUAGE: write your reply in {names[body.response_lang]}. "
                 f"Plain-text lines inside any note block you write are in {names[body.note_lang]}; math stays LaTeX. "
@@ -325,6 +439,7 @@ async def stream_reply(content, usage, model):
             if response.status_code != 200:
                 detail = (await response.aread()).decode(errors="replace")[:4000]
                 raise RuntimeError(f"model endpoint returned {response.status_code}: {detail}")
+            complete = False
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -333,10 +448,16 @@ async def stream_reply(content, usage, model):
                     usage.update(item.get("message", {}).get("usage") or {})
                 elif item.get("type") == "message_delta":
                     usage.update(item.get("usage") or {})
+                    if item.get("delta", {}).get("stop_reason") in ("max_tokens", "refusal"):
+                        raise RuntimeError("The model did not complete its answer. No note changes are available.")
+                elif item.get("type") == "message_stop":
+                    complete = True
                 elif item.get("type") == "error":
                     raise RuntimeError(item.get("error", {}).get("message") or "model error")
                 elif item.get("type") == "content_block_delta" and item.get("delta", {}).get("type") == "text_delta":
                     yield item["delta"]["text"]
+            if not complete:
+                raise RuntimeError("The model stream ended early. No note changes are available.")
 
 
 @app.post("/api/chat")
@@ -351,35 +472,58 @@ async def chat(body: Chat):
         raise HTTPException(422, "Unknown model")
     validate_image(body.image)
     validate_image(body.image_hires)
+    notes = await asyncio.to_thread(read_notes, body.lecture)
+    notes[body.page] = note_value(body.note)
 
     async def generate():
         answer, error, started = "", "cancelled", asyncio.get_running_loop().time()
-        want, usage, first = None, {}, None  # first: the first call's usage when the model asked for more
+        want, usage, first = None, {}, None
+        snapshots, requested_notes, retrieval_usage = {body.page: notes[body.page]}, set(), []
         try:
             await ensure_proxies()
-            # First call: ~1000px slide + text of the page and its neighbors. If the whole reply is requests
-            # ([[HIRES]], [[PAGES ...]]), ask once more with what it asked for.
-            for attempt in (1, 2):
-                usage, held = {}, attempt == 1  # held: the text could still be requests, don't show it yet
-                async for text in stream_reply(build_content(body, meta, want), usage, body.model):
+            for attempt in range(3):  # at most two lookups, then a final answer
+                usage, held, answer = {}, True, ""
+                async for text in stream_reply(build_content(body, meta, want, notes, snapshots, attempt == 2), usage, body.model):
                     answer += text
                     if not held:
                         yield event("delta", text=text)
                     elif len(answer) > 300 or not MAYBE_WANT.fullmatch(answer):
                         held = False
                         yield event("delta", text=answer)
-                if attempt == 1 and (want := wants(answer, meta["pages"])):
-                    first, answer = usage, ""
-                    hires, pages = want
+                lookup = wants(answer, meta["pages"])
+                if lookup:
+                    if attempt == 2:
+                        raise RuntimeError("Context lookup limit reached; ask a more specific question.")
+                    hires, pages, note_pages = lookup
+                    old_hires, old_pages = (want[0], set(want[1])) if want else (False, set())
+                    new_notes = [p for p in note_pages if p not in snapshots]
+                    if not ((hires and not old_hires) or set(pages) - old_pages or new_notes):
+                        raise RuntimeError("Repeated context request; no new context was requested.")
+                    for p in new_notes:
+                        text = notes.get(p, "")
+                        if len(text) > 50000 or sum(len(v) for v in snapshots.values()) + len(text) > NOTE_CONTEXT_LIMIT:
+                            raise RuntimeError("Requested notes exceed the context limit. Request fewer pages; no notes were changed.")
+                        snapshots[p] = text
+                    requested_notes.update(note_pages)
+                    want = (hires or old_hires, sorted(old_pages | set(pages)))
+                    first = first or usage
+                    retrieval_usage.append(usage)
                     reading = (["the slide at high resolution"] if hires else []) + \
-                              ([f"the text of {len(pages)} page{'s' * (len(pages) > 1)}"] if pages else [])
-                    yield event("status", message=f"Reading {' and '.join(reading) or 'the slide again'}…")
+                              ([f"the text of {len(pages)} page{'s' * (len(pages) > 1)}"] if pages else []) + \
+                              ([f"notes on {', '.join(f'p.{p}' for p in note_pages)}"] if note_pages else [])
+                    yield event("status", message=f"Reading {' and '.join(reading)}…")
                     continue
                 if held and answer:
                     yield event("delta", text=answer)
                 break
             if not answer.strip():
                 raise RuntimeError("The model returned no text.")
+            try:
+                proposal = parse_proposal(answer, body, meta, snapshots)
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError(f"Invalid note proposal: {exc}. Nothing was applied.") from exc
+            if proposal:
+                yield event("proposal", proposal=proposal)
             error = None
             yield event("done")
         except httpx.TimeoutException:
@@ -395,7 +539,8 @@ async def chat(body: Chat):
             log("chat", lecture=body.lecture, page=body.page, mode=body.mode, question=body.text, note=body.note,
                 thread=[t.model_dump() for t in body.thread], response_lang=body.response_lang, note_lang=body.note_lang,
                 model=body.model, answer=answer, error=error, seconds=round(asyncio.get_running_loop().time() - started, 1),
-                hires=bool(want and want[0]), pages=want[1] if want else [], usage=usage, first_usage=first)
+                hires=bool(want and want[0]), pages=want[1] if want else [], note_pages=sorted(requested_notes),
+                usage=usage, first_usage=first, retrieval_usage=retrieval_usage)
     return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 

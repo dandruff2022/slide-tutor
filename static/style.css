@@ -5,7 +5,16 @@ button,select,input{border:1px solid #cbd6ce;border-radius:6px;background:#fff;c
 button:hover{background:#edf3ee}button:disabled{opacity:.5;cursor:wait}
 main{display:grid;grid-template-columns:minmax(0,1fr) 340px;grid-template-rows:minmax(0,1fr) 205px;height:100%;gap:8px;padding:8px}
 .viewer{display:flex;flex-direction:column;min-height:0;gap:6px}
-.toolbar{display:flex;align-items:center;gap:6px}
+.toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.lecture-picker{position:relative;min-width:0}
+#lecture{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#lecture::after{content:' ▾'}
+#lecture-list{position:absolute;top:calc(100% + 4px);left:0;z-index:20;min-width:100%;width:max-content;max-width:min(360px,80vw);max-height:min(320px,50vh);overflow:auto;background:#fff;border:1px solid #cbd6ce;border-radius:6px;padding:4px;box-shadow:0 2px 10px #0002}
+#lecture-list[hidden]{display:none}
+#lecture-list [role=option]{padding:6px 10px;cursor:pointer;overflow-wrap:anywhere}
+#lecture-list [aria-selected=true]{font-weight:650}
+#lecture-list .active{background:#e2eee5;outline:1px solid #23674e;outline-offset:-1px}
+#slide-box:focus-visible,#lecture:focus-visible,#lecture-list:focus-visible{outline:2px solid #23674e;outline-offset:2px}
 #page{width:56px;text-align:center;cursor:text}#total{color:#63736c}
 #status{margin-left:auto;color:#8a4b2a;font-size:12px}
 #slide-box{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#e4e9e3;border-radius:6px}
@@ -17,11 +26,16 @@ main{display:grid;grid-template-columns:minmax(0,1fr) 340px;grid-template-rows:m
 .textLayer .endOfContent{display:block;position:absolute;inset:100% 0 0;z-index:0;cursor:default;user-select:none}
 .textLayer.selecting .endOfContent{top:0}
 #notes{grid-row:1;grid-column:2;overflow:auto;background:#fff;border:1px solid #d7dfd8;border-radius:6px;padding:6px 10px}
+#notes.moving-lines{overflow-y:hidden} /* Use our edge scroller, not the browser's competing drag auto-scroll. */
 .note-head{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid #e3e9e4;border-radius:0;padding:6px 0 2px;color:#63736c;font-size:12px;font-weight:600;background:none}
 .note-head:hover{color:#23674e;background:none}
 .note.current .note-head{color:#23674e}.note.current .note-head::after{content:" ●"}
-.note-body{padding:4px 0 8px;min-height:1.5em;overflow-x:auto}.note.current .note-body,.note.current .note-line{cursor:text}.note.current .note-line:hover{background:#f3f7f4}
+.note-body{padding:4px 0 8px 12px;min-height:1.5em;overflow-x:auto}.note.current .note-body,.note.current .note-line{cursor:text}.note.current .note-line:hover{background:#f3f7f4}
 .note-body p{margin:.3em 0}.note-line{margin:2px 0}
+.note-row{position:relative}
+/* The handle sits in .note-body's left padding (inside its overflow clip) and shows only beside selected lines. */
+.note-drag{position:absolute;left:-12px;top:2px;font-size:11px;line-height:1.4;color:#63736c;visibility:hidden;cursor:grab;user-select:none;-webkit-user-drag:element}
+.note-row.has-picked .note-drag{visibility:visible}.note-drag:active{cursor:grabbing}
 .note textarea{display:block;width:100%;border:1px solid #23674e;border-radius:4px;padding:6px;font:13px/1.45 ui-monospace,Menlo,monospace;resize:none;overflow:hidden}
 #response{grid-row:2;grid-column:1;overflow:auto;background:#fff;border:1px solid #d7dfd8;border-radius:6px;padding:8px 14px}
 #response p{margin:.4em 0}.empty{color:#8a978f}
@@ -40,6 +54,8 @@ pre{background:#f3f5f2;padding:8px;border-radius:4px;overflow:auto}
 #lang{position:relative}#lang summary{list-style:none;cursor:pointer;border:1px solid #cbd6ce;border-radius:6px;background:#fff;padding:4px 8px}#lang summary::-webkit-details-marker{display:none}
 .lang-menu{position:absolute;right:0;bottom:calc(100% + 4px);z-index:10;background:#fff;border:1px solid #cbd6ce;border-radius:6px;padding:8px;display:grid;gap:6px;box-shadow:0 2px 6px #0002;white-space:nowrap}.lang-menu label{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:12px}
 .note.current .note-line.picked{background:rgb(180 35 24 / .10);box-shadow:inset 3px 0 #b42318}
+.note-line.cut-pending{opacity:.45;background:#ecefec}
+#notes:focus-visible{outline:2px solid #23674e;outline-offset:1px}
 /* Chain link on the response | prompt boundary: links the next question to the answers above. */
 #link{grid-row:2;grid-column:2;justify-self:start;align-self:center;margin-left:-19px;z-index:2;width:30px;height:30px;padding:0;border-radius:50%;display:grid;place-items:center;color:#63736c}
 #link:disabled{opacity:1;cursor:default;color:#cfd6d1;background:#fff}
@@ -50,3 +66,23 @@ main.linked #prompt:focus{outline-color:#23674e}
 table{border-collapse:collapse;margin:.4em 0;font-size:13px}th,td{border:1px solid #d7dfd8;padding:3px 8px;text-align:left;vertical-align:top}th{background:#f3f5f2}
 .note-source{font:12px/1.6 ui-monospace,Menlo,monospace;color:#63736c;white-space:pre}
 .note.current .note-line.drop-before{box-shadow:inset 0 2px #23674e}.note.current .note-line.drop-after{box-shadow:inset 0 -2px #23674e}  /* where dragged lines will land */
+
+.note-body .katex-display{text-align:left}.note-body .katex-display>.katex{text-align:left}
+.note-item{display:flex;align-items:baseline;gap:.35em}.note-marker{flex:none;min-width:.65em;color:#63736c}.note-ordered>.note-marker{min-width:1.15em}.note-content{min-width:0;flex:1;overflow-x:auto;overflow-y:hidden}
+.note-line p{overflow-wrap:anywhere}.note-gap{height:.6em;min-height:.6em}
+.note-line :is(h1,h2,h3,h4,h5,h6){font-size:1em;font-weight:650;color:#23674e;margin:.8em 0 .3em;line-height:1.4}
+.note-line:first-child :is(h1,h2,h3,h4,h5,h6){margin-top:.2em}
+
+.note-tools{position:fixed;z-index:12;display:flex;gap:4px;align-items:center;padding:5px;background:#fff;border:1px solid #cbd6ce;border-radius:7px;box-shadow:0 2px 10px #0002}
+.note-tools[hidden]{display:none}.note-tools button{min-width:26px;height:26px;padding:2px 5px;font-size:12px}
+.note-tools button:first-child{font-weight:700}.note-tools button:nth-child(2){font-style:italic}.note-tools button:nth-child(3){font-weight:700;font-style:italic}
+.note-tools .note-swatch{min-width:22px;width:22px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px #cbd6ce}
+.note-tools .note-swatch[aria-pressed=true]{box-shadow:0 0 0 2px #23674e}.note-tools button:focus-visible{outline:2px solid #23674e;outline-offset:2px}
+.note-highlight-yellow{--marker-color:#fff09a;background:var(--marker-color)}.note-highlight-green{--marker-color:#bfe8bd;background:var(--marker-color)}.note-highlight-blue{--marker-color:#beddff;background:var(--marker-color)}.note-highlight-pink{--marker-color:#ffd0df;background:var(--marker-color)}.note-highlight-purple{--marker-color:#ddccfa;background:var(--marker-color)}
+.note-tools .note-swatch:hover{background:var(--marker-color)}
+mark[class^="note-highlight-"]{color:inherit;border-radius:2px;padding:0 .04em;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+
+.note-proposal{border:1px solid #cbd6ce;border-left:3px solid #23674e;border-radius:5px;padding:8px 10px;margin:8px 0}
+.note-proposal h3{font-size:1em;margin:0 0 6px}.note-proposal details{margin:8px 0}.note-proposal summary{cursor:pointer;font-weight:600;color:#23674e}
+.note-proposal pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}.note-proposal strong{display:block;margin-top:6px}
+.note-proposal button{margin:5px 6px 0 0}.note-proposal [hidden]{display:none}

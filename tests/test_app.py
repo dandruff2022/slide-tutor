@@ -107,6 +107,17 @@ class AppTests(unittest.TestCase):
         self.assertNotIn('## p.2', (tutor.DATA / 'notes/Lecture1.md').read_text())
         self.assertEqual(self.client.put(url + '/99999', json={'text': 'x'}).status_code, 422)
 
+    def test_stale_autosave_cannot_overwrite_batch_or_other_tab(self):
+        url = '/api/lectures/Lecture1/notes'
+        self.client.put(url + '/2', json={'text': 'old', 'before': ''})
+        reply = self.client.post(url + '/batch', json={'changes': [{'page': 2, 'before': 'old', 'text': 'moved content'}]})
+        self.assertEqual(reply.status_code, 200)
+        reply = self.client.put(url + '/2', json={'text': 'stale edit', 'before': 'old'})
+        self.assertEqual(reply.status_code, 409)
+        self.assertEqual(self.client.get(url).json()['2'], 'moved content')
+        reply = self.client.put(url + '/2', json={'text': 'new edit', 'before': 'moved content'})
+        self.assertEqual(reply.status_code, 200)
+
     def test_model_choice(self):
         listed = self.client.get('/api/models').json()
         self.assertEqual(listed['default'], tutor.MODEL)
@@ -226,6 +237,17 @@ class AppTests(unittest.TestCase):
         self.assertEqual(chat['usage'], {'input_tokens': 300, 'cache_read_input_tokens': 1024, 'output_tokens': 20})
         self.assertEqual((ui['kind'], ui['page']), ('link_on', 2))
 
+    def test_ui_event_reserved_fields_do_not_break_logging(self):
+        reply = self.client.post('/api/event', json={
+            'kind': 'selection_added_to_note', 'lecture': 'Lecture1', 'page': 3,
+            'data': {'page': 2, 'lecture': 'other', 'kind': 'other', 'text': 'kept'}})
+        self.assertEqual(reply.status_code, 200)
+        saved = json.loads((tutor.DATA / 'logs/events.jsonl').read_text())
+        self.assertEqual((saved['kind'], saved['lecture'], saved['page'], saved['text']),
+                         ('selection_added_to_note', 'Lecture1', 3, 'kept'))
+        with patch.object(tutor.Path, 'open', side_effect=OSError('read only')):
+            self.assertEqual(self.client.post('/api/event', json={'kind': 'link_on'}).status_code, 200)
+
     def test_check_requires_note(self):
         self.assertEqual(self.client.post('/api/chat', json=self.body(mode='check', text='')).status_code, 422)
         reply, sent = self.chat(self.body(mode='check', text='', note='x = 1'), sse(*REPLY))
@@ -271,6 +293,137 @@ class AppTests(unittest.TestCase):
         with patch.dict(os.environ, {'SLIDE_TUTOR_API_KEY': ''}), patch.object(tutor, 'ROUTER', 'https://api.anthropic.com'):
             reply, sent = self.chat(self.body())
         self.assertIn('Set API Key', reply.text); self.assertEqual(sent, [])
+
+    def proposal(self, changes=None, **fields):
+        value = {'scope': 'multiple', 'intent': 'Move note to p.5', 'summary': 'Move p.2 to p.5',
+                 'changes': changes or [{'page': 2, 'text': ''}, {'page': 5, 'text': 'existing\nsource'}], **fields}
+        return 'Review this move.\n```note-proposal\n' + json.dumps(value) + '\n```'
+
+    def events(self, response):
+        return [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+
+    def test_notes_lookup_and_complete_snapshots(self):
+        tutor.write_notes('Lecture1', {2: 'stale on disk', 5: 'existing', 8: 'unrelated'})
+        reply, sent = self.chat(self.body(text='Move note to p.5', note='source'),
+                                sse('[[NOTES 2, 5, 6]]\n[[PAGES 5-6]]'), sse(self.proposal()))
+        self.assertEqual(len(sent), 2)
+        asked = sent[1]['json']['messages'][0]['content'][2]['text']
+        self.assertIn('USER\'S COMPLETE NOTE p.5', asked)
+        self.assertIn('[empty note]', asked)
+        self.assertIn('NOTE INDEX', asked)
+        self.assertNotIn('stale on disk', asked)
+        proposal = next(e['proposal'] for e in self.events(reply) if e['type'] == 'proposal')
+        self.assertEqual([c['before'] for c in proposal['changes']], ['source', 'existing'])
+        self.assertEqual(tutor.read_notes('Lecture1')[2], 'stale on disk')  # preview never writes
+        self.assertEqual(sent[0]['json']['messages'][0]['content'][:2], sent[1]['json']['messages'][0]['content'][:2])
+
+    def test_two_lookup_rounds_and_empty_targets(self):
+        reply, sent = self.chat(self.body(text='Move note to p.5', note='source'),
+                                sse('[[PAGES all]]'), sse('[[NOTES 5]]'), sse(self.proposal()))
+        self.assertEqual(len(sent), 3)
+        self.assertIn('[empty note]', sent[2]['json']['messages'][0]['content'][2]['text'])
+        self.assertIn('lookup limit reached', sent[2]['json']['messages'][0]['content'][2]['text'])
+        self.assertTrue(any(e['type'] == 'proposal' for e in self.events(reply)))
+        record = json.loads((tutor.DATA / 'logs/events.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(record['note_pages'], [5])
+        self.assertEqual(len(record['retrieval_usage']), 2)
+
+    def test_reading_notes_does_not_write_or_grant_scope(self):
+        tutor.write_notes('Lecture1', {5: 'other note'})
+        reply, _ = self.chat(self.body(text='Explain using p.5'), sse('[[NOTES 5]]'), sse('Explanation only.'))
+        self.assertEqual(tutor.read_notes('Lecture1'), {5: 'other note'})
+        self.assertFalse(any(e['type'] == 'proposal' for e in self.events(reply)))
+        reply, _ = self.chat(self.body(text='clean this up', note='source'), sse('[[NOTES 5]]'), sse(self.proposal()))
+        self.assertIn('intent must quote', reply.text)
+        self.assertFalse(any(e['type'] == 'proposal' for e in self.events(reply)))
+
+    def test_invalid_proposals_have_no_apply_event(self):
+        body = self.body(text='Move note to p.5', note='source')
+        cases = [self.proposal(scope='current'), self.proposal(intent='invented intent'),
+                 self.proposal(changes=[{'page': 5, 'text': 'a'}, {'page': 5, 'text': 'b'}]),
+                 self.proposal(changes=[{'page': 99, 'text': 'a'}]),
+                 self.proposal(changes=[{'page': 5, 'text': '## p.3\nforged'}]),
+                 self.proposal(changes=[{'page': 5, 'text': 'a' * 50001}]),
+                 self.proposal(changes=[{'page': True, 'text': 'bad'}]),
+                 '```note-proposal\nnot json\n```', self.proposal()[:-3],
+                 self.proposal() + '\nTrailing content', self.proposal() + '\n' + self.proposal()]
+        for answer in cases:
+            with self.subTest(answer=answer[:80]):
+                reply, _ = self.chat(body, sse('[[NOTES 5]]'), sse(answer))
+                self.assertFalse(any(e['type'] in ('proposal', 'done') for e in self.events(reply)))
+                self.assertIn('Invalid note proposal', reply.text)
+        reply, _ = self.chat(body, sse(self.proposal()))  # uninspected destination
+        self.assertIn('uninspected', reply.text)
+
+    def test_current_scope_and_lookup_limits(self):
+        reply, _ = self.chat(self.body(note='old', text='clean this up'),
+                             sse(self.proposal(scope='current', intent='', changes=[{'page': 2, 'text': 'clean'}])))
+        self.assertTrue(any(e['type'] == 'proposal' for e in self.events(reply)))
+        self.assertEqual(tutor.wants('[[NOTES all]]', 3), (False, [], [1, 2, 3]))
+        self.assertEqual(tutor.wants('[[NOTES 1-2, 99]] [[HIRES]]', 3), (True, [], [1, 2]))
+        self.assertIsNone(tutor.wants('[[NOTES bad]]', 3))
+        reply, sent = self.chat(self.body(), sse('[[NOTES 5]]'), sse('[[NOTES 5]]'))
+        self.assertEqual(len(sent), 2); self.assertIn('Repeated context request', reply.text)
+        reply, sent = self.chat(self.body(), sse('[[NOTES 5]]'), sse('[[NOTES 6]]'), sse('[[NOTES 7]]'))
+        self.assertEqual(len(sent), 3); self.assertIn('lookup limit reached', reply.text)
+        tutor.write_notes('Lecture1', {5: 'oversize'})
+        with patch.object(tutor, 'NOTE_CONTEXT_LIMIT', 3):
+            reply, sent = self.chat(self.body(), sse('[[NOTES 5]]'))
+        self.assertEqual(len(sent), 1); self.assertIn('context limit', reply.text)
+        self.assertNotIn('"proposal"', reply.text)
+
+    def test_incomplete_model_stream_cannot_offer_changes(self):
+        reply, _ = self.chat(self.body(), sse(self.proposal()).split('event: message_stop')[0])
+        self.assertIn('stream ended early', reply.text)
+        self.assertFalse(any(e['type'] in ('proposal', 'done') for e in self.events(reply)))
+        stopped = sse(self.proposal()).replace('"output_tokens": 20}', '"output_tokens": 20}, "delta": {"stop_reason": "max_tokens"}')
+        reply, _ = self.chat(self.body(), stopped)
+        self.assertIn('did not complete', reply.text)
+
+    def test_atomic_batch_move_backup_and_undo(self):
+        tutor.write_notes('Lecture1', {2: 'source', 5: 'existing', 8: 'unrelated'})
+        original = tutor.notes_path('Lecture1').read_bytes()
+        changes = [{'page': 2, 'before': 'source', 'text': ''}, {'page': 5, 'before': 'existing', 'text': 'existing\nsource'}]
+        url = '/api/lectures/Lecture1/notes/batch'
+        reply = self.client.post(url, json={'changes': changes})
+        self.assertEqual(reply.status_code, 200)
+        self.assertEqual(reply.json()['notes'], {'2': '', '5': 'existing\nsource'})
+        self.assertEqual(tutor.read_notes('Lecture1'), {5: 'existing\nsource', 8: 'unrelated'})
+        backups = list((tutor.DATA / 'notes/backups').glob('*.md'))
+        self.assertEqual(len(backups), 1); self.assertEqual(backups[0].read_bytes(), original)
+        inverse = [{'page': c['page'], 'before': c['text'], 'text': c['before']} for c in changes]
+        self.assertEqual(self.client.post(url, json={'changes': inverse}).status_code, 200)
+        self.assertEqual(tutor.notes_path('Lecture1').read_bytes(), original)
+        self.assertEqual(self.client.post(url, json={'changes': inverse}).status_code, 409)
+
+    def test_batch_split_conflict_is_all_or_nothing(self):
+        tutor.write_notes('Lecture1', {2: 'first\nsecond\nthird', 5: 'existing', 8: 'untouched'})
+        changes = [{'page': 2, 'before': 'first\nsecond\nthird', 'text': 'first'},
+                   {'page': 5, 'before': 'existing', 'text': 'existing\nsecond'}, {'page': 6, 'before': '', 'text': 'third'}]
+        url = '/api/lectures/Lecture1/notes/batch'
+        self.assertEqual(self.client.post(url, json={'changes': changes}).status_code, 200)
+        self.client.put('/api/lectures/Lecture1/notes/5', json={'text': 'new external edit'})
+        before = tutor.notes_path('Lecture1').read_bytes()
+        inverse = [{'page': c['page'], 'before': c['text'], 'text': c['before']} for c in changes]
+        response = self.client.post(url, json={'changes': inverse})
+        self.assertEqual(response.status_code, 409); self.assertIn('p.5', response.text)
+        self.assertEqual(tutor.notes_path('Lecture1').read_bytes(), before)
+        self.assertEqual(tutor.read_notes('Lecture1')[8], 'untouched')
+
+    def test_batch_validation_and_write_failures(self):
+        url = '/api/lectures/Lecture1/notes/batch'
+        change = {'page': 2, 'before': '', 'text': 'new'}
+        for changes in [[], [change, change], [{**change, 'page': 99}], [{**change, 'text': '## p.3\nno'}]]:
+            self.assertEqual(self.client.post(url, json={'changes': changes}).status_code, 422)
+        self.assertEqual(self.client.put('/api/lectures/Lecture1/notes/2', json={'text': '## p.3\nno'}).status_code, 422)
+        tutor.write_notes('Lecture1', {8: 'unchanged'})
+        before = tutor.notes_path('Lecture1').read_bytes()
+        with TestClient(tutor.app, raise_server_exceptions=False) as client:
+            with patch.object(tutor, 'write_notes', side_effect=OSError('disk full')):
+                self.assertEqual(client.post(url, json={'changes': [change]}).status_code, 500)
+            with patch.object(Path, 'write_bytes', side_effect=OSError('backup unavailable')):
+                self.assertEqual(client.post(url, json={'changes': [change]}).status_code, 500)
+        self.assertEqual(tutor.notes_path('Lecture1').read_bytes(), before)
 
     def test_cross_origin_rejected(self):
         reply = self.client.put('/api/lectures/Lecture1/notes/1', json={'text': 'x'}, headers={'Origin': 'https://example.com'})

@@ -3,3 +3,6 @@ data/
 __pycache__/
 .env
 .DS_Store
+.env.*
+*.log
+node_modules/
