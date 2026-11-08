@@ -24,26 +24,11 @@ Then, from the icon: **Set API Key…** (an [Anthropic API key](https://console.
 Requires Python 3.10+. Double-click `run.cmd`: it creates `.venv`, installs the requirements and starts `tray_win.py`
 (a blue book icon in the notification area; Windows may hide it under the **^** arrow).
 
-The tray works like the macOS menu bar (left or right click opens the menu), with two differences: **Edit Settings…** opens the `env` file in Notepad (it
-replaces **Set API Key…**; add `SLIDE_TUTOR_API_KEY=...` there), and **Restart Courses** applies your edits.
-Courses and settings live in `%APPDATA%\slide-tutor\` (`courses.json`, `env`). **Launch at Login** adds a per-user
-`Run` registry value. Lectures and notes behave the same; use Ctrl where this manual says ⌘.
-
-`SLIDE_TUTOR_START_CMD` runs once when the tray starts, if `SLIDE_TUTOR_ROUTER`'s local port is closed. Its output goes
-to `%APPDATA%\slide-tutor\proxy.log`, and the process keeps running after **Quit**. Example for
-[antigravity-claude-proxy](https://github.com/badri-s2001/antigravity-claude-proxy):
-
-```sh
-npm install -g antigravity-claude-proxy
-antigravity-claude-proxy accounts add
-```
-
-```sh
-SLIDE_TUTOR_ROUTER=http://127.0.0.1:8080
-SLIDE_TUTOR_MODELS=gemini-3.8-flash-tiered=Gemini 3.8 Flash
-SLIDE_TUTOR_MODEL=gemini-3.8-flash-tiered
-SLIDE_TUTOR_START_CMD=antigravity-claude-proxy start --log
-```
+The tray works like the macOS menu bar (left or right click opens the menu): **Set API Key…** asks for an
+[Anthropic API key](https://console.anthropic.com/) and restarts the courses. Two Windows-only items: **Edit Settings…**
+opens the `env` file in Notepad (for the [model endpoint](#model-endpoint) settings), and **Restart Courses** applies
+your edits. Courses and settings live in `%APPDATA%\slide-tutor\` (`courses.json`, `env`). **Launch at Login** adds a
+per-user `Run` registry value. Lectures and notes behave the same; use Ctrl where this manual says ⌘.
 
 ## Menu bar
 - **Add Slides Folder…**: pick a folder of lecture PDFs. Each course gets its own local server (ports from 8765 up);
@@ -59,7 +44,8 @@ tutor's prompt) defaults to the slides folder's parent folder name and can be ed
 ## Model endpoint
 By default the tutor calls the Anthropic API with your key, choosing between Claude Sonnet 5.5 and Claude Haiku 4.5
 in the **🌐** menu (remembered per browser). To use another Anthropic-compatible endpoint (e.g. a LiteLLM proxy) or
-other models, add `KEY=VALUE` lines to `~/Library/Application Support/slide-tutor/env` and restart the menu bar app:
+other models, add `KEY=VALUE` lines to `~/Library/Application Support/slide-tutor/env` (Windows: **Edit Settings…**) and
+restart the menu bar app (Windows: **Restart Courses**):
 
 ```sh
 SLIDE_TUTOR_ROUTER=http://127.0.0.1:4000          # endpoint base URL (POST /v1/messages, streamed)
@@ -67,6 +53,9 @@ SLIDE_TUTOR_MODELS=model-a=Model A,model-b=Model B  # choices in the 🌐 menu (
 SLIDE_TUTOR_MODEL=model-a                         # default choice
 SLIDE_TUTOR_START_CMD=~/bin/start-my-proxy        # optional: run when the endpoint is down
 ```
+
+On Windows, `SLIDE_TUTOR_START_CMD` runs once when the tray starts, if `SLIDE_TUTOR_ROUTER`'s local port is closed;
+its output goes to `%APPDATA%\slide-tutor\proxy.log`, and the process keeps running after **Quit**.
 
 ## Layout
 - **Slide** (left): lecture picker, ← → buttons, arrow keys (←↑ previous, →↓ next) or a two-finger scroll / mouse wheel over the slide (one page per gesture). The lecture menu has a bounded, scrollable list: arrows and Home/End select an item, Enter commits, Escape cancels, and Tab moves on. Choosing a lecture returns focus to the reader; clicking the slide (including selectable text) also restores page-arrow navigation. Arrows inside notes, search, the prompt, or other inputs keep their editing behavior; Escape from the prompt or page-number input returns to the reader. **⌘F** searches every page of the lecture: typing jumps to the first matching page, Enter / Shift+Enter = next / previous match, Esc clears; matches are highlighted on the slide.

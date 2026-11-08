@@ -8,7 +8,7 @@ import sys
 import webbrowser
 import winreg
 from pathlib import Path
-from tkinter import Tk, filedialog
+from tkinter import Tk, filedialog, simpledialog
 from urllib.parse import urlsplit
 
 import pystray
@@ -61,14 +61,24 @@ def set_login(enabled):
             winreg.DeleteValue(key, RUN_VALUE)
 
 
-def pick_folder():
+def dialog(ask):
+    """Run a Tk dialog in front of other windows (the tray has no window of its own)."""
     window = Tk()
     window.withdraw()
     window.attributes('-topmost', True)
     try:
-        return filedialog.askdirectory(parent=window, title='Choose a slides folder')
+        return ask(window)
     finally:
         window.destroy()
+
+
+def pick_folder():
+    return dialog(lambda window: filedialog.askdirectory(parent=window, title='Choose a slides folder'))
+
+
+def ask_key():
+    return dialog(lambda window: simpledialog.askstring(
+        'slide-tutor', 'Anthropic API key (saved in %APPDATA%\\slide-tutor\\env):', show='*', parent=window))
 
 
 class Tray:
@@ -135,6 +145,7 @@ class Tray:
                 pystray.MenuItem('Remove', lambda: self.remove(course))))
         return [*map(course_item, self.courses), pystray.Menu.SEPARATOR,
                 pystray.MenuItem('Add Slides Folder…', self.add_folder),
+                pystray.MenuItem('Set API Key…', self.set_key),
                 pystray.MenuItem('Edit Settings…', self.edit_settings),
                 pystray.MenuItem('Restart Courses', self.restart),
                 pystray.MenuItem('Launch at Login', self.toggle_login, checked=lambda _: login_enabled()),
@@ -159,6 +170,16 @@ class Tray:
         self.save()
         self.start(course, settings())
         self.icon.update_menu()
+
+    def set_key(self):
+        key = (ask_key() or '').strip()
+        if not key:
+            return
+        lines = [line for line in (ENV.read_text(encoding='utf-8-sig').splitlines() if ENV.exists() else [])
+                 if not line.startswith('SLIDE_TUTOR_API_KEY=')]
+        ENV.parent.mkdir(parents=True, exist_ok=True)
+        ENV.write_text('\n'.join(lines + [f'SLIDE_TUTOR_API_KEY={key}']) + '\n', encoding='utf-8')
+        self.restart()  # restart the courses with the new key
 
     def edit_settings(self):
         ENV.parent.mkdir(parents=True, exist_ok=True)
