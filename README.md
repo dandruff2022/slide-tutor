@@ -112,6 +112,8 @@ Consecutive stars upgrade the same selection; they do not replace its text. The 
 Formatting saves automatically; **⌘Z** immediately after formatting restores the previous note. Multi-line selections keep list markers and indentation. Formula/code source and table syntax are left unchanged; select the surrounding prose to format it. Normal typing without a selection and the existing line copy/cut, delete, and drag actions still work. Check note preserves existing emphasis and marker colors.
 
 ## Reading and reorganizing notes across pages
+![Asking the tutor to move two lines from p.2 to p.3, reviewing, applying and undoing](docs/note-crosspage.gif)
+
 Use **Ask** or **Check note** normally; there is no multi-page mode switch.
 
 - **“Explain this using my p.5 note.”** The tutor can read that note for context. Reading does not authorize changes.
